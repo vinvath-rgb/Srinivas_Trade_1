@@ -1,4 +1,4 @@
-# Backtester (Srini) — Composite default (Voting+MACD, SMA 10/50), Canada suffix retry, 2-sheet Excel export
+# Backtester (Srini) — Composite default (Voting+MACD, SMA 10/50), stateful stops, Canada suffix retry, 2-sheet Excel export
 import os, io, time, numpy as np, pandas as pd, yfinance as yf
 from pandas_datareader import data as pdr
 import streamlit as st
@@ -122,70 +122,138 @@ def composite_signal(price: pd.Series,
         comp[hot] = 0.0
     return comp.fillna(0.0)
 
-# ---------------- Sizing / Stops / PnL ----------------
+# ---------------- Sizing ----------------
 def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy: int = 252) -> pd.Series:
     vol = returns.ewm(span=20, adjust=False).std() * np.sqrt(ppy)
     vol.replace(0, np.nan, inplace=True)
     lev = (vol_target / (vol + 1e-12)).clip(upper=5.0).fillna(0.0)
     return signal * lev
 
+# ---------------- Stateful execution with ATR stops/TP, costs, tax ----------------
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series,
                 atr_stop_mult: float, tp_mult: float,
-                trade_cost: float=0.0, tax_rate: float=0.0) -> pd.Series:
-    c = df[price_col(df)]; ret = c.pct_change().fillna(0.0)
+                trade_cost: float = 0.0, tax_rate: float = 0.0) -> pd.Series:
+    """
+    Stateful execution:
+      - Active position is independent of the raw signal to avoid immediate re-entry after stop/TP.
+      - Re-entry is blocked until the signal passes through 0 (flat) once after a stop/TP exit.
+      - Properly counts entries, exits, flips, and costs.
+    """
+    c = df[price_col(df)]
+    ret = c.pct_change().fillna(0.0)
     pnl = pd.Series(0.0, index=c.index)
 
-    current_pos = 0.0; entry = np.nan; last_sign = 0.0
-    entries = exits = flips = 0; total_cost_paid = 0.0
+    active_sign = 0           # -1, 0, +1 -> actual live position sign
+    entry = np.nan            # entry price of the active trade
+    block_reentry = False     # prevent immediate re-entry under same signal after stop/TP
+
+    entries = exits = flips = 0
+    total_cost_paid = 0.0
 
     for i in range(len(c)):
-        s, px = float(pos.iloc[i]), float(c.iloc[i])
-        a = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else np.nan
-        new_sign = np.sign(s); signal_change = (new_sign != last_sign)
+        px = float(c.iloc[i])
+        a  = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else np.nan
 
-        # trade costs on signal change
-        if signal_change:
-            if last_sign == 0 and new_sign != 0:
-                entries += 1; total_cost_paid += trade_cost; pnl.iloc[i] -= trade_cost; entry = px
-            elif last_sign != 0 and new_sign == 0:
-                exits   += 1; total_cost_paid += trade_cost; pnl.iloc[i] -= trade_cost; entry = np.nan
+        # Raw signal & leverage for the day
+        desired_sign = int(np.sign(pos.iloc[i]))
+        lev = abs(float(pos.iloc[i]))  # position magnitude from vol targeting
+
+        # Clear the post-exit block once we see a flat signal
+        if block_reentry and desired_sign == 0:
+            block_reentry = False
+
+        # Handle signal-driven flips/exits
+        if active_sign != 0 and desired_sign != active_sign:
+            if desired_sign == 0:
+                # Exit by signal
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                active_sign = 0
+                entry = np.nan
             else:
-                flips   += 1; total_cost_paid += 2*trade_cost; pnl.iloc[i] -= 2*trade_cost; entry = px
-        last_sign = new_sign; current_pos = s
+                # Flip: exit + entry on same bar
+                flips += 1
+                total_cost_paid += 2 * trade_cost
+                pnl.iloc[i] -= 2 * trade_cost
+                active_sign = desired_sign
+                entry = px
 
-        if current_pos == 0 or np.isnan(a):  # flat days
+        # If flat and allowed, take new entry when signal appears
+        if active_sign == 0 and desired_sign != 0 and not block_reentry:
+            entries += 1
+            total_cost_paid += trade_cost
+            pnl.iloc[i] -= trade_cost
+            active_sign = desired_sign
+            entry = px
+
+        # No active position or no ATR -> no P&L from price move
+        if active_sign == 0 or np.isnan(a):
             continue
 
-        if current_pos > 0:  # long
+        # Effective position uses today's leverage magnitude with active sign
+        eff_pos = active_sign * lev
+
+        if active_sign > 0:  # long
             stop = entry * (1 - atr_stop_mult * a / max(entry, 1e-12))
             tp   = entry * (1 + tp_mult     * a / max(entry, 1e-12))
+
             if px <= stop:
-                exits += 1; total_cost_paid += trade_cost; pnl.iloc[i] -= trade_cost
-                current_pos = 0.0; last_sign = 0.0; entry = np.nan; continue
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                active_sign = 0
+                entry = np.nan
+                block_reentry = True
+                continue
+
             if px >= tp:
-                realized = (tp/entry) - 1.0
-                pnl.iloc[i] += current_pos * realized
-                if realized > 0: pnl.iloc[i] *= (1 - tax_rate)
-                exits += 1; total_cost_paid += trade_cost; pnl.iloc[i] -= trade_cost
-                current_pos = 0.0; last_sign = 0.0; entry = np.nan; continue
-            pnl.iloc[i] += current_pos * ret.iloc[i]
+                realized = (tp / entry) - 1.0
+                pnl.iloc[i] += eff_pos * realized
+                if realized > 0:
+                    pnl.iloc[i] *= (1 - tax_rate)
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                active_sign = 0
+                entry = np.nan
+                block_reentry = True
+                continue
+
+            # Daily mark-to-market
+            pnl.iloc[i] += eff_pos * ret.iloc[i]
+
         else:  # short
             stop = entry * (1 + atr_stop_mult * a / max(entry, 1e-12))
             tp   = entry * (1 - tp_mult     * a / max(entry, 1e-12))
+
             if px >= stop:
-                exits += 1; total_cost_paid += trade_cost; pnl.iloc[i] -= trade_cost
-                current_pos = 0.0; last_sign = 0.0; entry = np.nan; continue
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                active_sign = 0
+                entry = np.nan
+                block_reentry = True
+                continue
+
             if px <= tp:
-                realized = (entry/tp) - 1.0
-                pnl.iloc[i] += current_pos * realized
-                if realized > 0: pnl.iloc[i] *= (1 - tax_rate)
-                exits += 1; total_cost_paid += trade_cost; pnl.iloc[i] -= trade_cost
-                current_pos = 0.0; last_sign = 0.0; entry = np.nan; continue
-            pnl.iloc[i] += current_pos * ret.iloc[i]
+                realized = (entry / tp) - 1.0
+                pnl.iloc[i] += eff_pos * realized
+                if realized > 0:
+                    pnl.iloc[i] *= (1 - tax_rate)
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                active_sign = 0
+                entry = np.nan
+                block_reentry = True
+                continue
+
+            pnl.iloc[i] += eff_pos * ret.iloc[i]
 
     pnl.attrs["entries"] = int(entries)
-    pnl.attrs["exits"] = int(exits)
-    pnl.attrs["flips"] = int(flips)
+    pnl.attrs["exits"]   = int(exits)
+    pnl.attrs["flips"]   = int(flips)
     pnl.attrs["total_cost_paid"] = round(float(total_cost_paid), 6)
     return pnl
 
@@ -314,7 +382,7 @@ def load_prices(tickers_raw: str, start, end) -> dict:
 
 # ---------------- UI ----------------
 st.title("📊 Backtester — SMA / RSI / Composite")
-st.caption("Composite default (Voting + MACD, SMA 10/50). Vol targeting, ATR stops/TP, costs/tax, trade counts, inputs/metrics, payoffs, Excel export.")
+st.caption("Composite default (Voting + MACD, SMA 10/50). Stateful stops. Vol targeting, ATR stops/TP, costs/tax, trade counts, inputs/metrics, payoffs, Excel export.")
 
 with st.sidebar:
     st.header("Backtest Settings")
