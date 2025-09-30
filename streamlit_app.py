@@ -1,4 +1,4 @@
-# streamlit_app.py — Backtester (US/CA) with Debug Mode + Excel export
+# streamlit_app.py — Backtester with EstVol (past) + ActualVol (future) in Debug
 import os, io, time
 import numpy as np
 import pandas as pd
@@ -7,10 +7,10 @@ from pandas_datareader import data as pdr
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ============== PAGE CONFIG (must be first Streamlit call) ==============
-st.set_page_config(page_title="Srini Backtester (with Debug Mode)", layout="wide")
+# ----------------------- PAGE CONFIG (must be first Streamlit call) -----------------------
+st.set_page_config(page_title="Srini Backtester (Est vs Actual Vol)", layout="wide")
 
-# ============== AUTH (optional) =====================
+# ----------------------- OPTIONAL AUTH -----------------------
 def _auth():
     pw = os.getenv("APP_PASSWORD", "")
     if not pw:
@@ -21,7 +21,7 @@ def _auth():
             st.stop()
 _auth()
 
-# ============== UTILS ==============================
+# ----------------------- UTILS -----------------------
 def price_col(df): return "Adj Close" if "Adj Close" in df.columns else "Close"
 def _to_ts(d):     return pd.to_datetime(d).tz_localize(None)
 
@@ -41,7 +41,7 @@ def max_drawdown(eq: pd.Series):
     t = dd.idxmin(); p = roll.loc[:t].idxmax()
     return float(dd.min()), p, t
 
-# ============== INDICATORS =========================
+# ----------------------- INDICATORS -----------------------
 def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     d = series.diff()
     up = d.clip(lower=0); dn = -d.clip(upper=0)
@@ -68,13 +68,17 @@ def compute_atr(df: pd.DataFrame, lb: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1/lb, adjust=False).mean()
 
-def compute_realized_vol_and_lev(returns: pd.Series, vol_target: float, lookback: int = 20, ppy: int = 252):
-    """Rolling realized vol (stdev * sqrt(252)) and implied leverage = target / realized."""
-    realized = returns.rolling(lookback).std() * np.sqrt(ppy)
-    lev = (vol_target / (realized + 1e-12)).clip(lower=0.0, upper=5.0)
-    return realized, lev
+# ----- Volatility measures: EstVol (past) and ActualVol (future) -----
+def realized_vol(returns: pd.Series, lookback: int = 20, ppy: int = 252):
+    """Rolling historical (past) realized vol (annualized)."""
+    return returns.rolling(lookback).std() * np.sqrt(ppy)
 
-# ============== SIGNALS ============================
+def future_realized_vol(returns: pd.Series, lookahead: int = 20, ppy: int = 252):
+    """Future realized vol (annualized) computed over next window: shift(-lookahead)."""
+    fwd = returns.rolling(lookahead).std().shift(-lookahead) * np.sqrt(ppy)
+    return fwd
+
+# ----------------------- SIGNALS -----------------------
 def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
     ma_f, ma_s = price.rolling(fast).mean(), price.rolling(slow).mean()
     sig = pd.Series(0.0, index=price.index)
@@ -82,8 +86,8 @@ def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
     return sig.fillna(0.0)
 
 def rsi_signals(price: pd.Series, rsi_lb: int, rsi_buy: int, rsi_sell: int) -> pd.Series:
-    r = rsi(price, lb=rsi_lb); sig = pd.Series(0.0, index=price.index)
-    sig[r < rsi_buy] = 1.0; sig[r > rsi_sell] = -1.0
+    rr = rsi(price, lb=rsi_lb); sig = pd.Series(0.0, index=price.index)
+    sig[rr < rsi_buy] = 1.0; sig[rr > rsi_sell] = -1.0
     return sig.fillna(0.0)
 
 def composite_signal(price: pd.Series,
@@ -116,23 +120,17 @@ def composite_signal(price: pd.Series,
         comp[hot] = 0.0
     return comp.fillna(0.0)
 
-# ============== SIZING =============================
+# ----------------------- SIZING -----------------------
 def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy: int = 252) -> pd.Series:
     vol = returns.ewm(span=20, adjust=False).std() * np.sqrt(ppy)
     vol.replace(0, np.nan, inplace=True)
     lev = (vol_target / (vol + 1e-12)).clip(upper=5.0).fillna(0.0)
     return signal * lev
 
-# ============== EXECUTION (stateful, stops/TP) =====
+# ----------------------- EXECUTION (stateful) -----------------------
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series,
                 atr_stop_mult: float, tp_mult: float,
                 trade_cost: float = 0.0, tax_rate: float = 0.0) -> pd.Series:
-    """
-    Stateful execution engine:
-      - Separate active position sign from raw signal to avoid instant re-entry after stop/TP.
-      - Re-entry blocked until signal passes through 0.
-      - Flip (long->short) counts as exit+entry (2 costs).
-    """
     c = df[price_col(df)]; ret = c.pct_change().fillna(0.0)
     pnl = pd.Series(0.0, index=c.index)
 
@@ -209,13 +207,13 @@ def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series,
     pnl.attrs["total_cost_paid"] = round(float(total_cost_paid), 6)
     return pnl
 
-# ============== RAW CAGR (buy & hold) ===============
+# ----------------------- RAW CAGR -----------------------
 def simple_cagr(df: pd.DataFrame) -> float:
     px = df[price_col(df)]; s, e = float(px.iloc[0]), float(px.iloc[-1])
     yrs = max((df.index[-1]-df.index[0]).days/365.25, 1e-9)
     return (e/max(s,1e-12))**(1/yrs) - 1
 
-# ============== BACKTEST CORE (returns debug optionally) ===
+# ----------------------- BACKTEST (with EstVol + ActualVol) -----------------------
 def backtest(df: pd.DataFrame, strategy: str, params: dict,
              vol_target: float, long_only: bool, atr_stop: float, tp_mult: float,
              trade_cost: float=0.0, tax_rate: float=0.0,
@@ -241,17 +239,18 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 
     if long_only: sig = sig.clip(lower=0.0)
 
-    # Production sizer
-    pos = position_sizer(sig, rets, vol_target)
+    # Vol targeting → position sizing
+    est_vol = realized_vol(rets, lookback=20)                 # <-- EstVol (past)
+    lev = (vol_target / (est_vol + 1e-12)).clip(upper=5.0)    # same as position_sizer core
+    pos = (sig * lev).fillna(0.0)
 
-    # Debug realized vol / leverage
-    dbg_vol, dbg_lev = compute_realized_vol_and_lev(rets, vol_target, lookback=debug_lb)
-    dbg_pos = (sig * dbg_lev).shift(1)
-
-    # Execute with stops/TP
+    # Execution with stops/TP
     atr = compute_atr(df, lb=14)
     pnl = apply_stops(df, pos, atr, atr_stop, tp_mult, trade_cost=trade_cost, tax_rate=tax_rate)
     equity = (1 + pnl).cumprod()
+
+    # Actual future vol (lookahead window)
+    act_vol = future_realized_vol(rets, lookahead=20)
 
     stats = {
         "CAGR": round(annualized_return(pnl), 4),
@@ -269,28 +268,28 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
     if debug:
         debug_df = pd.DataFrame({
             "Return": rets,
-            "RealizedVol": dbg_vol,
-            "Leverage": dbg_lev,
+            "EstVol": est_vol,        # past window (used by algo)
+            "ActualVol": act_vol,     # next window (what happened)
             "Signal": sig,
-            "PreExecPosition": dbg_pos,
-        }).dropna().copy()
-        levered_days  = int((debug_df["Leverage"] > 1.0).sum())
-        derisk_days   = int((debug_df["Leverage"] < 1.0).sum())
-        neutral_days  = int((debug_df["PreExecPosition"] == 0).sum())
-        avg_lev       = float(debug_df["Leverage"].mean())
-        max_lev       = float(debug_df["Leverage"].max())
-        debug_summary = {
-            "LeveredDays(>1x)": levered_days,
-            "DeriskDays(<1x)": derisk_days,
-            "NeutralDays(Pos=0)": neutral_days,
-            "AvgLeverage": round(avg_lev, 3),
-            "MaxLeverage": round(max_lev, 3),
+            "Leverage": lev,
+            "PreExecPosition": (sig * lev).shift(1)
+        }).dropna(subset=["Return"])  # keep consistent
+
+        # Summary: how good was EstVol vs ActualVol?
+        aligned = debug_df.dropna(subset=["EstVol","ActualVol"])
+        vol_err = (aligned["ActualVol"] - aligned["EstVol"]).abs()
+        debug_summary = [{
             "Rows": int(len(debug_df)),
-        }
+            "Avg EstVol": round(float(aligned["EstVol"].mean()), 4) if len(aligned) else np.nan,
+            "Avg ActualVol": round(float(aligned["ActualVol"].mean()), 4) if len(aligned) else np.nan,
+            "Mean |Actual-Est|": round(float(vol_err.mean()), 4) if len(aligned) else np.nan,
+            "Days Underestimated (Actual>Est)": int((aligned["ActualVol"] > aligned["EstVol"]).sum()) if len(aligned) else 0,
+            "Days Overestimated (Actual<Est)": int((aligned["ActualVol"] < aligned["EstVol"]).sum()) if len(aligned) else 0,
+        }]
 
     return equity, stats, debug_df, debug_summary
 
-# ============== DATA LOADER (Yahoo + .TO/.V retry + Stooq fallback) ===
+# ----------------------- DATA LOADER (Yahoo + TSX/TSXV retry + Stooq) -----------------------
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end) -> dict:
     tickers_input = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
@@ -347,9 +346,8 @@ def load_prices(tickers_raw: str, start, end) -> dict:
         if not d.empty: cleaned[t] = d
     return cleaned
 
-# ============== UI =================================
-st.title("📊 Srini Backtester — SMA / RSI / Composite + Debug Mode")
-st.caption("Vol targeting, stateful ATR stops/TP, costs/tax, multi-ticker, metrics, payoffs, and optional Debug sheets in the Excel export.")
+# ----------------------- UI -----------------------
+st.title("📊 Srini Backtester — EstVol vs ActualVol (SMA / RSI / Composite)")
 
 with st.sidebar:
     st.header("Backtest Settings")
@@ -357,7 +355,7 @@ with st.sidebar:
     start = st.date_input("Start", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end   = st.date_input("End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
-    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion", "Composite"], index=2)
+    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion", "Composite"], index=0)
 
     if strategy == "SMA Crossover":
         c1, c2 = st.columns(2)
@@ -403,18 +401,13 @@ with st.sidebar:
     lot_size = st.number_input("Lot size for payoff (sh/ticker)", 1, 100000, 100)
 
     st.subheader("Debug / Export")
-    debug_mode = st.checkbox("Run Debug Mode (log vol/leverage/position)", value=False)
-    debug_lookback = st.number_input("Debug vol lookback (days)", 5, 100, 20, 1)
+    debug_mode = st.checkbox("Run Debug Mode (log EstVol/ActualVol)", value=True)
+    debug_lookback = st.number_input("Debug vol lookback (days)", 5, 100, 20, 1)  # for title only; actual lookback is fixed at 20 here
     include_debug_in_excel = st.checkbox("Include Debug sheets in Excel", value=True)
 
     run_btn = st.button("Run Backtest")
 
-with st.expander("🧪 Diagnostics", expanded=False):
-    st.write("yfinance:", getattr(yf, "__version__", "unknown"))
-    if st.button("Clear caches"):
-        load_prices.clear(); st.success("Caches cleared. Rerun.")
-
-# ============== RUN =================================
+# ----------------------- RUN -----------------------
 if run_btn:
     data = load_prices(tickers, start, end)
     if not data:
@@ -451,18 +444,16 @@ if run_btn:
                 debug=debug_mode, debug_lb=int(debug_lookback)
             )
 
-            # Plot equity
             st.subheader(f"{t} — Equity Curve")
             st.line_chart(equity, height=300)
 
-            # Metrics line
             raw_cagr = simple_cagr(df)
             st.markdown(
                 f"**Buy & Hold CAGR:** {raw_cagr:.2%}  |  "
                 f"**Strategy CAGR:** {stats['CAGR']:.2%}  |  "
                 f"**Sharpe:** {stats['Sharpe']:.2f}  |  "
                 f"**MaxDD:** {stats['MaxDD']:.2%}  |  "
-                f"**Exposure (time in mkt):** {stats['Exposure']:.0%}  |  "
+                f"**Exposure:** {stats['Exposure']:.0%}  |  "
                 f"**Entries/Exits/Flips:** {stats['Trades_Entered']}/{stats['Trades_Exited']}/{stats['Flips']}  |  "
                 f"**Total Costs:** {stats['TotalCosts(%)']:.3f}%"
             )
@@ -485,17 +476,18 @@ if run_btn:
 
             results.append({"Ticker": t, "RawCAGR": round(raw_cagr,4), **stats})
 
-            # Collect debug
+            # Collect debug rows
             if debug_mode and dbg_df is not None and not dbg_df.empty:
-                dcopy = dbg_df.copy()
-                dcopy.insert(0, "Ticker", t)
+                dcopy = dbg_df.copy(); dcopy.insert(0, "Ticker", t)
                 all_debug_rows.append(dcopy)
                 if dbg_sum:
-                    all_dbg_summ.append({"Ticker": t, **dbg_sum})
+                    for row in dbg_sum:
+                        row["Ticker"] = t
+                    all_dbg_summ += dbg_sum
 
     # Results table
     res_df = pd.DataFrame(results).set_index("Ticker")
-    res_df["CAGR Δ (Strategy - Raw)"] = (res_df["CAGR"] - res_df["RawCAGR"]).round(4)
+    res_df["CAGR Δ (Strat − Raw)"] = (res_df["CAGR"] - res_df["RawCAGR"]).round(4)
     st.subheader("📋 Metrics Summary")
     st.dataframe(res_df, use_container_width=True)
 
@@ -527,7 +519,7 @@ if run_btn:
     st.subheader("💵 Simulated Payoffs")
     st.dataframe(pay_df, use_container_width=True)
 
-    # Inputs table
+    # Inputs table (for Excel)
     def _strategy_name_and_params(strategy, params):
         if strategy == "SMA Crossover":
             return strategy, {"Fast SMA": params.get("fast"), "Slow SMA": params.get("slow")}
@@ -558,16 +550,14 @@ if run_btn:
     st.subheader("⚙️ Inputs")
     st.dataframe(inputs_df, use_container_width=True)
 
-    # ========== Excel Export (adds Debug sheets if enabled) ==========
+    # ----------------------- Excel Export (Inputs+Metrics, Payoffs, Debug) -----------------------
     with io.BytesIO() as output:
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            # Tab 1: Inputs + Metrics
             inputs_df.to_excel(writer, sheet_name="Inputs_&_Metrics", index=False, startrow=0)
             res_df.reset_index().to_excel(writer, sheet_name="Inputs_&_Metrics", index=False, startrow=len(inputs_df)+2)
-            # Tab 2: Payoffs
             pay_df.reset_index().to_excel(writer, sheet_name="Simulated_Payoffs", index=False)
 
-            # Debug tabs (optional)
+            # Debug tabs (optional) — include EstVol & ActualVol columns
             if include_debug_in_excel and debug_mode:
                 if all_debug_rows:
                     debug_cat = pd.concat(all_debug_rows, axis=0, ignore_index=True)
@@ -578,6 +568,6 @@ if run_btn:
 
         data_xlsx = output.getvalue()
 
-    st.download_button("⬇️ Download Backtest Report (Excel, 2–4 tabs)",
+    st.download_button("⬇️ Download Backtest Report (Excel, with EstVol & ActualVol)",
                        data_xlsx, "Backtest_Report.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
