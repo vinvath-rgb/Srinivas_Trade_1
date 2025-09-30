@@ -1,24 +1,24 @@
-# US Backtester (Srini) — SMA / RSI / COMPOSITE + ATR stops, Raw vs Strategy, costs/tax
-# IMPORTANT: Must be the first Streamlit call
-import os, time, numpy as np, pandas as pd, yfinance as yf
+# US Backtester (Srini) — full app with 2-sheet Excel export
+# NOTE: set_page_config must be first Streamlit call
+import os, io, time, numpy as np, pandas as pd, yfinance as yf
 from pandas_datareader import data as pdr
-import streamlit as st, matplotlib.pyplot as plt
+import streamlit as st
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="US Backtester (Srini)", layout="wide")
 
-# -------- Auth (env APP_PASSWORD) --------
+# ---------------- Auth (optional: APP_PASSWORD env) ----------------
 def _auth():
-    pw_env = os.getenv("APP_PASSWORD", "")
-    if not pw_env:
+    pw = os.getenv("APP_PASSWORD", "")
+    if not pw:
         return
     with st.sidebar:
         st.subheader("🔒 App Login")
-        pw = st.text_input("Password", type="password", key="auth_password")
-        if pw != pw_env:
+        if st.text_input("Password", type="password", key="auth_pw") != pw:
             st.stop()
 _auth()
 
-# --------- Helpers / Indicators ----------
+# ---------------- Helpers & Indicators ----------------
 def price_col(df): return "Adj Close" if "Adj Close" in df.columns else "Close"
 def _to_ts(d):     return pd.to_datetime(d).tz_localize(None)
 
@@ -55,7 +55,7 @@ def annualized_return(returns: pd.Series, ppy: int = 252) -> float:
     return total ** (1 / max(years, 1e-9)) - 1
 
 def sharpe(returns: pd.Series, rf: float = 0.0, ppy: int = 252) -> float:
-    if returns.std() == 0 or returns.empty: return 0.0
+    if returns.empty or returns.std() == 0: return 0.0
     excess = returns - rf / ppy
     return float(np.sqrt(ppy) * excess.mean() / (excess.std() + 1e-12))
 
@@ -67,7 +67,7 @@ def max_drawdown(equity: pd.Series):
     peak = roll_max.loc[:trough].idxmax()
     return float(dd.min()), peak, trough
 
-# --------- Signals ----------
+# ---------------- Signals ----------------
 def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
     ma_f, ma_s = price.rolling(fast).mean(), price.rolling(slow).mean()
     sig = pd.Series(0.0, index=price.index)
@@ -92,7 +92,7 @@ def composite_signal(
     atr_series: pd.Series | None = None,
     atr_cap_pct=0.05,
 ):
-    # 1) Trend (SMA)
+    # 1) Trend
     ma_f = price.rolling(sma_fast).mean()
     ma_s = price.rolling(sma_slow).mean()
     sma_sig = pd.Series(0.0, index=price.index)
@@ -105,7 +105,7 @@ def composite_signal(
     rsi_sig[r < rsi_buy] = 1.0
     rsi_sig[r > rsi_sell] = -1.0
 
-    # 3) MACD (optional)
+    # 3) MACD optional
     if use_macd:
         _, _, h = macd(price)
         macd_sig = pd.Series(0.0, index=price.index)
@@ -117,26 +117,24 @@ def composite_signal(
     # Combine
     if use_and:
         comp = pd.Series(0.0, index=price.index)
-        # require alignment of signs (non-negative for long regime / non-positive for short)
         agree_long  = ((sma_sig == 1) & (rsi_sig >= 0) & ((macd_sig >= 0) | (~use_macd)))
         agree_short = ((sma_sig == -1) & (rsi_sig <= 0) & ((macd_sig <= 0) | (~use_macd)))
         comp[agree_long]  = 1.0
         comp[agree_short] = -1.0
     else:
-        # voting: need at least 2 agreements
         score = sma_sig + rsi_sig + macd_sig
         comp = pd.Series(0.0, index=price.index)
         comp[score >= 2]  = 1.0
         comp[score <= -2] = -1.0
 
-    # ATR hot-vol filter
+    # ATR hot filter
     if atr_filter and atr_series is not None:
         hot = (atr_series / price).fillna(0) > atr_cap_pct
         comp[hot] = 0.0
 
     return comp.fillna(0.0)
 
-# --------- Sizing / Stops / P&L ----------
+# ---------------- Position sizing / Stops / PnL ----------------
 def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy: int = 252) -> pd.Series:
     vol = returns.ewm(span=20, adjust=False).std() * np.sqrt(ppy)
     vol.replace(0, np.nan, inplace=True)
@@ -146,61 +144,113 @@ def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series,
                 atr_stop_mult: float, tp_mult: float,
                 trade_cost: float = 0.0, tax_rate: float = 0.0) -> pd.Series:
+    """Apply ATR stops/TP, charge entry & exit costs, and count trades."""
     c = df[price_col(df)]
     ret = c.pct_change().fillna(0.0)
     pnl = pd.Series(0.0, index=c.index)
-    current_pos, entry = 0.0, np.nan
-    last_pos = 0.0
+
+    current_pos = 0.0
+    entry = np.nan
+    last_sign = 0.0
+
+    # accounting
+    entries = exits = flips = 0
+    total_cost_paid = 0.0
 
     for i in range(len(c)):
         s, px = float(pos.iloc[i]), float(c.iloc[i])
         a = float(atr.iloc[i]) if not np.isnan(atr.iloc[i]) else np.nan
 
-        # detect trade/change of position (entry/exit/flip)
-        signal_change = (np.sign(s) != np.sign(last_pos))
-        last_pos = s
+        new_sign = np.sign(s)
+        signal_change = (new_sign != last_sign)
 
-        if i == 0 or signal_change:
-            entry = px
-            # cost on any entry/exit (one side); treat flip as exit+entry
-            pnl.iloc[i] -= trade_cost
+        # Handle trade costs on position changes
+        if signal_change:
+            if last_sign == 0 and new_sign != 0:
+                # ENTRY
+                entries += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                entry = px
+            elif last_sign != 0 and new_sign == 0:
+                # EXIT
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                entry = np.nan
+            else:
+                # FLIP (exit + entry)
+                flips += 1
+                total_cost_paid += 2 * trade_cost
+                pnl.iloc[i] -= 2 * trade_cost
+                entry = px
 
+        last_sign = new_sign
         current_pos = s
 
         if current_pos == 0 or np.isnan(a):
-            # flat day
-            continue
+            continue  # flat day
 
-        # active position: compute stops/TP
-        if current_pos > 0:
+        # Active position: compute ATR stops/TP
+        if current_pos > 0:  # long
             stop = entry * (1 - atr_stop_mult * a / max(entry, 1e-12))
             tp   = entry * (1 + tp_mult     * a / max(entry, 1e-12))
-            if px <= stop or px >= tp:
-                # realized exit on this bar -> apply cost & (simplified) tax on gains
-                # approximate realized P&L magnitude when TP hits; at stop we assume 0 extra here
-                realized = (tp/entry - 1.0) if px >= tp else 0.0
-                if realized > 0:
-                    pnl.iloc[i] += current_pos * realized
-                    pnl.iloc[i] *= (1 - tax_rate)
+            if px <= stop:
+                # stop exit → exit cost already applied at next signal change, but we charge here too to be explicit
+                exits += 1
+                total_cost_paid += trade_cost
                 pnl.iloc[i] -= trade_cost
                 current_pos = 0.0
-            else:
-                pnl.iloc[i] += current_pos * ret.iloc[i]
-        else:
+                last_sign = 0.0
+                entry = np.nan
+                continue
+            if px >= tp:
+                # TP exit → realize gain and tax, then exit cost
+                realized = (tp / entry) - 1.0
+                pnl.iloc[i] += current_pos * realized
+                if realized > 0:
+                    pnl.iloc[i] *= (1 - tax_rate)
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                current_pos = 0.0
+                last_sign = 0.0
+                entry = np.nan
+                continue
+            pnl.iloc[i] += current_pos * ret.iloc[i]
+
+        else:  # short
             stop = entry * (1 + atr_stop_mult * a / max(entry, 1e-12))
             tp   = entry * (1 - tp_mult     * a / max(entry, 1e-12))
-            if px >= stop or px <= tp:
-                realized = (entry/tp - 1.0) if px <= tp else 0.0
-                if realized > 0:
-                    pnl.iloc[i] += current_pos * realized
-                    pnl.iloc[i] *= (1 - tax_rate)
+            if px >= stop:
+                exits += 1
+                total_cost_paid += trade_cost
                 pnl.iloc[i] -= trade_cost
                 current_pos = 0.0
-            else:
-                pnl.iloc[i] += current_pos * ret.iloc[i]
+                last_sign = 0.0
+                entry = np.nan
+                continue
+            if px <= tp:
+                realized = (entry / tp) - 1.0
+                pnl.iloc[i] += current_pos * realized
+                if realized > 0:
+                    pnl.iloc[i] *= (1 - tax_rate)
+                exits += 1
+                total_cost_paid += trade_cost
+                pnl.iloc[i] -= trade_cost
+                current_pos = 0.0
+                last_sign = 0.0
+                entry = np.nan
+                continue
+            pnl.iloc[i] += current_pos * ret.iloc[i]
+
+    pnl.attrs["entries"] = int(entries)
+    pnl.attrs["exits"] = int(exits)
+    pnl.attrs["flips"] = int(flips)
+    pnl.attrs["total_cost_paid"] = round(float(total_cost_paid), 6)
     return pnl
 
-# --------- Backtest core ----------
+# ---------------- Backtest core ----------------
 def backtest(df: pd.DataFrame, strategy: str, params: dict,
              vol_target: float, long_only: bool, atr_stop: float, tp_mult: float,
              trade_cost: float = 0.0, tax_rate: float = 0.0):
@@ -212,7 +262,7 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
     elif strategy == "RSI Mean Reversion":
         sig = rsi_signals(price, params["rsi_lb"], params["rsi_buy"], params["rsi_sell"])
     elif strategy == "Composite":
-        atr = compute_atr(df, lb=params.get("atr_lb", 14))
+        atr_s = compute_atr(df, lb=params.get("atr_lb", 14))
         sig = composite_signal(
             price,
             rsi_lb=params.get("rsi_lb",14),
@@ -223,7 +273,7 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
             use_and=params.get("use_and", True),
             use_macd=params.get("use_macd", True),
             atr_filter=params.get("atr_filter", False),
-            atr_series=atr,
+            atr_series=atr_s,
             atr_cap_pct=params.get("atr_cap_pct", 0.05),
         )
     else:
@@ -242,7 +292,11 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
         "Sharpe": round(sharpe(pnl), 2),
         "MaxDD": round(max_drawdown(equity)[0], 4),
         "Exposure": round(float((pnl != 0).sum()) / max(len(pnl), 1), 3),
-        "LastEquity": round(float(equity.iloc[-1]) if not equity.empty else 1.0, 4),
+        "LastEquity": round(float(equity.iloc[-1]) if len(equity) else 1.0, 4),
+        "Trades_Entered": pnl.attrs.get("entries", 0),
+        "Trades_Exited": pnl.attrs.get("exits", 0),
+        "Flips": pnl.attrs.get("flips", 0),
+        "TotalCosts(%)": round(100 * pnl.attrs.get("total_cost_paid", 0.0), 3),
     }
     return equity, stats
 
@@ -265,10 +319,14 @@ def evaluate_ticker(df: pd.DataFrame, ticker: str, strategy: str, params: dict,
         "MaxDD": stats["MaxDD"],
         "Exposure": stats["Exposure"],
         "LastEquity": stats["LastEquity"],
+        "Trades_Entered": stats["Trades_Entered"],
+        "Trades_Exited": stats["Trades_Exited"],
+        "Flips": stats["Flips"],
+        "TotalCosts(%)": stats["TotalCosts(%)"],
     }
     return equity, stats_out
 
-# --------- Data loading (yfinance + Stooq fallback) ----------
+# ---------------- Data loader (yfinance + Stooq fallback) ----------------
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end) -> dict:
     tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
@@ -320,7 +378,7 @@ def load_prices(tickers_raw: str, start, end) -> dict:
         except Exception:
             pass
 
-    # clean
+    # final clean
     cleaned = {}
     for t, d in results.items():
         if d is None or d.empty: continue
@@ -329,7 +387,7 @@ def load_prices(tickers_raw: str, start, end) -> dict:
         if not d.empty: cleaned[t] = d
     return cleaned
 
-# --------- SMA cross events (for chart/inspection) ----------
+# ---------------- SMA cross events for charting (optional) ----------------
 def compute_sma_cross_events(df: pd.DataFrame, fast: int, slow: int):
     close = df[price_col(df)]
     ma_f = close.rolling(fast).mean()
@@ -348,9 +406,9 @@ def compute_sma_cross_events(df: pd.DataFrame, fast: int, slow: int):
     events.index.name = "Date"
     return ma_f, ma_s, events
 
-# --------- UI ---------
+# ---------------- UI: Controls ----------------
 st.title("🇺🇸 US Backtester — SMA / RSI / Composite (Srini)")
-st.caption("Raw vs Strategy, ATR stops/TP, optional costs/taxes, SMA cross events, yfinance (Stooq fallback).")
+st.caption("Composite strategy, ATR stops/TP, costs/taxes, trade counts, payoffs, and Excel export (2 sheets).")
 
 with st.sidebar:
     st.header("Backtest Settings")
@@ -358,7 +416,7 @@ with st.sidebar:
     start = st.date_input("Start", value=pd.to_datetime("2015-01-01"), key="sb_start").strftime("%Y-%m-%d")
     end   = st.date_input("End", value=pd.Timestamp.today(), key="sb_end").strftime("%Y-%m-%d")
 
-    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion", "Composite"], key="main_strategy")
+    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion", "Composite"], key="sb_strategy")
 
     c1, c2 = st.columns(2)
     if strategy == "SMA Crossover":
@@ -370,7 +428,7 @@ with st.sidebar:
         rsi_buy = c2.number_input("RSI Buy <", 5, 50, 30, 1, key="sb_rsi_buy")
         rsi_sell = st.number_input("RSI Sell >", 50, 95, 70, 1, key="sb_rsi_sell")
         params = {"rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell)}
-    else:
+    else:  # Composite
         f1, f2, f3 = st.columns(3)
         fast = f1.number_input("Fast SMA", 2, 200, 20, 1, key="cmp_fast")
         slow = f2.number_input("Slow SMA", 5, 400, 100, 5, key="cmp_slow")
@@ -394,12 +452,15 @@ with st.sidebar:
 
     long_only  = st.checkbox("Long-only", value=True, key="sb_long_only")
     vol_target = st.slider("Vol target (ann.)", 0.05, 0.40, 0.12, 0.01, key="sb_vol")
-    atr_stop   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5, key="sb_atr_stop")
+    atr_stop   = st.slider("ATR Stop (×)", 1.0, 8.0, 3.0, 0.5, key="sb_atr_stop")
     tp_mult    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5, key="sb_tp")
 
     st.subheader("Real-world frictions")
     trade_cost = st.number_input("Cost per trade (%)", 0.0, 0.50, 0.05, 0.01, key="sb_cost") / 100.0
     tax_rate   = st.number_input("Effective tax on gains (%)", 0.0, 50.0, 0.0, 1.0, key="sb_tax") / 100.0
+
+    lot_size = st.number_input("Lot size (shares per ticker)", 1, 100000, 100, key="sb_lot")
+
     run_btn    = st.button("Run Backtest", key="btn_run")
 
 with st.expander("🔧 Diagnostics"):
@@ -408,11 +469,11 @@ with st.expander("🔧 Diagnostics"):
         load_prices.clear()
         st.success("Caches cleared.")
 
-# --------- Run backtests ---------
+# ---------------- Run backtests ----------------
 if run_btn:
     data = load_prices(tickers, start, end)
     if not data:
-        st.error("No data downloaded. Try other tickers/dates.")
+        st.error("No data downloaded. Try other tickers/dates or add .TO for Canadian listings.")
         st.stop()
 
     st.caption("Loaded → " + ", ".join(sorted(data.keys())))
@@ -435,9 +496,12 @@ if run_btn:
                 f"**Strategy CAGR:** {stats['StrategyCAGR']:.2%}  |  "
                 f"**Sharpe:** {stats['Sharpe']:.2f}  |  "
                 f"**MaxDD:** {stats['MaxDD']:.2%}  |  "
-                f"**Exposure:** {stats['Exposure']:.0%}"
+                f"**Exposure:** {stats['Exposure']:.0%}  |  "
+                f"**Entries/Exits/Flips:** {stats['Trades_Entered']}/{stats['Trades_Exited']}/{stats['Flips']}  |  "
+                f"**Total Costs:** {stats['TotalCosts(%)']:.3f}%"
             )
 
+            # Optional SMA cross plot when SMA strategy is selected
             if strategy == "SMA Crossover":
                 ma_f, ma_s, events = compute_sma_cross_events(df, params["fast"], params["slow"])
                 close = df[price_col(df)]
@@ -453,93 +517,121 @@ if run_btn:
                 ax.legend(loc="best"); ax.grid(True, alpha=0.3)
                 st.pyplot(fig, clear_figure=True)
 
-                st.subheader("SMA Crossover Events")
-                if events.empty:
-                    st.write("No crossovers in the selected window.")
-                else:
-                    st.dataframe(events.tail(20).round({"Price":2,"FastSMA":2,"SlowSMA":2}), use_container_width=True)
-
             results.append({"Ticker": t, **stats})
 
-    if results:
-        res_df = pd.DataFrame(results).set_index("Ticker")
-        res_df["CAGR Δ (Strategy-Raw)"] = (res_df["StrategyCAGR"] - res_df["RawCAGR"]).round(4)
-        st.subheader("📋 Summary (Raw vs Strategy)")
-        st.dataframe(res_df, use_container_width=True)
-        st.download_button("Download Results CSV", res_df.to_csv().encode(), "results_summary.csv", key="dl_summary")
+    # ---------- Metrics summary ----------
+    res_df = pd.DataFrame(results).set_index("Ticker")
+    res_df["CAGR Δ (Strategy-Raw)"] = (res_df["StrategyCAGR"] - res_df["RawCAGR"]).round(4)
 
-# --------- Simple comparator for ACN vs ETFs ---------
-with st.expander("🆚 Compare: Accenture (ACN) vs ETFs"):
-    default_start = "2015-01-01"
-    default_end   = pd.Timestamp.today().strftime("%Y-%m-%d")
-    c1, c2 = st.columns(2)
-    start_cmp = c1.text_input("Start (YYYY-MM-DD)", value=default_start, key="cmp_start")
-    end_cmp   = c2.text_input("End (YYYY-MM-DD)",   value=default_end,   key="cmp_end")
-    universe = st.text_input("Tickers to compare", value="ACN, SPY, XLK, VT", key="cmp_universe")
+    st.subheader("📋 Summary (Inputs & Metrics)")
+    st.dataframe(res_df, use_container_width=True)
+    st.download_button("Download Metrics CSV", res_df.to_csv().encode(), "metrics_summary.csv", key="dl_metrics")
 
-    strat = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion", "Composite"], index=2, key="compare_strategy")
-    cc1, cc2, cc3 = st.columns(3)
-    if strat == "SMA Crossover":
-        fast_cmp = cc1.number_input("Fast SMA", 2, 200, 20, 1, key="cmp_fast")
-        slow_cmp = cc2.number_input("Slow SMA", 5, 400, 100, 5, key="cmp_slow")
-        params_cmp = {"fast": int(fast_cmp), "slow": int(slow_cmp)}
-    elif strat == "RSI Mean Reversion":
-        rsi_lb_cmp  = cc1.number_input("RSI lookback", 2, 100, 14, 1, key="cmp_rsi_lb")
-        rsi_buy_cmp = cc2.number_input("RSI Buy <", 5, 50, 30, 1, key="cmp_rsi_buy")
-        rsi_sell_cmp= cc3.number_input("RSI Sell >", 50, 95, 70, 1, key="cmp_rsi_sell")
-        params_cmp = {"rsi_lb": int(rsi_lb_cmp), "rsi_buy": int(rsi_buy_cmp), "rsi_sell": int(rsi_sell_cmp)}
-    else:
-        fast_cmp = cc1.number_input("Fast SMA", 2, 200, 20, 1, key="cmp2_fast")
-        slow_cmp = cc2.number_input("Slow SMA", 5, 400, 100, 5, key="cmp2_slow")
-        use_macd_cmp = cc3.checkbox("Use MACD", value=True, key="cmp2_use_macd")
-        rr1, rr2, rr3 = st.columns(3)
-        rsi_lb_cmp  = rr1.number_input("RSI lookback", 2, 100, 14, 1, key="cmp2_rsi_lb")
-        rsi_buy_cmp = rr2.number_input("RSI Buy <", 5, 50, 35, 1, key="cmp2_rsi_buy")
-        rsi_sell_cmp= rr3.number_input("RSI Sell >", 50, 95, 65, 1, key="cmp2_rsi_sell")
-        gg1, gg2, gg3 = st.columns(3)
-        combine_logic_cmp = gg1.selectbox("Combine", ["AND (strict)", "Voting (≥2)"], index=0, key="cmp2_logic")
-        atr_filter_cmp = gg2.checkbox("ATR 'too hot' filter", value=False, key="cmp2_atr_filter")
-        atr_cap_cmp = gg3.number_input("Max ATR/Price", 0.01, 0.20, 0.05, 0.01, key="cmp2_atr_cap")
-        params_cmp = {
-            "fast": int(fast_cmp), "slow": int(slow_cmp),
-            "rsi_lb": int(rsi_lb_cmp), "rsi_buy": int(rsi_buy_cmp), "rsi_sell": int(rsi_sell_cmp),
-            "use_macd": bool(use_macd_cmp),
-            "use_and": combine_logic_cmp.startswith("AND"),
-            "atr_filter": bool(atr_filter_cmp),
-            "atr_cap_pct": float(atr_cap_cmp),
-        }
+    # ---------- Inputs table (for Excel Tab 1) ----------
+    def _strategy_name_and_params(strategy, params):
+        if strategy == "SMA Crossover":
+            return strategy, {
+                "Fast SMA": params.get("fast"),
+                "Slow SMA": params.get("slow"),
+            }
+        elif strategy == "RSI Mean Reversion":
+            return strategy, {
+                "RSI lookback": params.get("rsi_lb"),
+                "RSI Buy <": params.get("rsi_buy"),
+                "RSI Sell >": params.get("rsi_sell"),
+            }
+        else:
+            return strategy, {
+                "Fast SMA": params.get("fast"),
+                "Slow SMA": params.get("slow"),
+                "RSI lookback": params.get("rsi_lb"),
+                "RSI Buy <": params.get("rsi_buy"),
+                "RSI Sell >": params.get("rsi_sell"),
+                "Use MACD": params.get("use_macd"),
+                "Combine": "AND" if params.get("use_and", True) else "Voting (≥2)",
+                "ATR hot filter": params.get("atr_filter", False),
+                "Max ATR/Price": params.get("atr_cap_pct"),
+            }
 
-    long_only_cmp  = st.checkbox("Long-only (ETFs)", value=True, key="cmp_longonly")
-    vol_target_cmp = st.slider("Vol target (ann.)", 0.05, 0.40, 0.12, 0.01, key="cmp_vol")
-    atr_stop_cmp   = st.slider("ATR Stop (×)", 1.0, 6.0, 3.0, 0.5, key="cmp_atr")
-    tp_mult_cmp    = st.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5, key="cmp_tp")
-    cost_cmp       = st.number_input("Cost per trade (%)", 0.0, 0.50, 0.05, 0.01, key="cmp_cost") / 100.0
-    tax_cmp        = st.number_input("Effective tax on gains (%)", 0.0, 50.0, 0.0, 1.0, key="cmp_tax") / 100.0
+    strat_name, strat_params = _strategy_name_and_params(strategy, params)
+    inputs_rows = [
+        ("Tickers", ", ".join(sorted(data.keys()))),
+        ("Start", start),
+        ("End", end),
+        ("Strategy", strat_name),
+    ]
+    for k, v in strat_params.items():
+        inputs_rows.append((k, v))
+    inputs_rows.extend([
+        ("Long-only", long_only),
+        ("Vol target (ann.)", vol_target),
+        ("ATR Stop (×)", atr_stop),
+        ("Take Profit (× ATR)", tp_mult),
+        ("Cost per trade (%)", round(trade_cost*100, 3)),
+        ("Effective tax on gains (%)", round(tax_rate*100, 3)),
+        ("Lot size (sh)", lot_size),
+    ])
+    inputs_df = pd.DataFrame(inputs_rows, columns=["Parameter", "Value"])
 
-    if st.button("Run comparison", key="btn_run_cmp"):
-        tickers_cmp = [t.strip().upper() for t in universe.split(",") if t.strip()]
-        data_cmp = load_prices(",".join(tickers_cmp), start_cmp, end_cmp)
-        if not data_cmp:
-            st.error("No data downloaded for the selected tickers/range.")
-            st.stop()
+    st.subheader("🧰 Inputs (as used)")
+    st.dataframe(inputs_df, use_container_width=True)
+    st.download_button("Download Inputs CSV", inputs_df.to_csv(index=False).encode(), "inputs_summary.csv", key="dl_inputs")
 
-        rows, equities = [], []
-        for t in tickers_cmp:
-            df = data_cmp.get(t)
-            if df is None or df.empty: continue
-            eq, stats = evaluate_ticker(
-                df, t, strat, params_cmp, vol_target_cmp, long_only_cmp, atr_stop_cmp, tp_mult_cmp,
-                trade_cost=cost_cmp, tax_rate=tax_cmp
-            )
-            rows.append({"Ticker": t, **stats})
-            equities.append(eq.rename(t) / float(eq.iloc[0]))
+    # ---------- Simulated Payoffs (Excel Tab 2) ----------
+    pay_rows = []
+    for t in res_df.index:
+        df_t = data.get(t)
+        if df_t is None or df_t.empty: continue
+        close = df_t[price_col(df_t)]
+        start_px = float(close.iloc[0])
+        end_px   = float(close.iloc[-1])
 
-        if rows:
-            res = pd.DataFrame(rows).set_index("Ticker").sort_values("StrategyCAGR", ascending=False)
-            res["CAGR Δ (Strategy-Raw)"] = (res["StrategyCAGR"] - res["RawCAGR"]).round(4)
-            st.subheader("Summary (Strategy vs Raw)")
-            st.dataframe(res, use_container_width=True)
-            if equities:
-                combined = pd.concat(equities, axis=1).dropna(how="all")
-                st.subheader("Normalized Equity Curves (start = 1.0)")
-                st.line_chart(combined, height=360)
+        init_cap = lot_size * start_px
+        end_cap_strategy = init_cap * float(res_df.loc[t, "LastEquity"])
+        pnl_strategy = end_cap_strategy - init_cap
+
+        end_cap_buyhold = lot_size * end_px
+        pnl_buyhold = end_cap_buyhold - init_cap
+
+        pay_rows.append({
+            "Ticker": t,
+            "StartPx": round(start_px, 4),
+            "EndPx": round(end_px, 4),
+            "LotSize(sh)": int(lot_size),
+            "Initial($)": round(init_cap, 2),
+            "Ending_Strategy($)": round(end_cap_strategy, 2),
+            "P&L_Strategy($)": round(pnl_strategy, 2),
+            "Ending_BuyHold($)": round(end_cap_buyhold, 2),
+            "P&L_BuyHold($)": round(pnl_buyhold, 2),
+            "Δ P&L (Strat − B&H)($)": round(pnl_strategy - pnl_buyhold, 2),
+        })
+
+    pay_df = pd.DataFrame(pay_rows).set_index("Ticker")
+    if not pay_df.empty:
+        totals = pay_df.select_dtypes(include=[float, int]).sum(numeric_only=True)
+        totals_df = pd.DataFrame(totals).T
+        totals_df.index = ["TOTAL"]
+        pay_df = pd.concat([pay_df, totals_df], axis=0)
+
+    st.subheader("💵 Simulated Payoffs")
+    st.dataframe(pay_df, use_container_width=True)
+    st.download_button("Download Payoffs CSV", pay_df.to_csv().encode(), "simulated_payoffs.csv", key="dl_payoffs")
+
+    # ---------- One Excel file with 2 sheets ----------
+    import io
+    with io.BytesIO() as output:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            inputs_df.to_excel(writer, sheet_name="Inputs_&_Metrics", index=False, startrow=0)
+            # leave a blank row then metrics
+            res_df.reset_index().to_excel(writer, sheet_name="Inputs_&_Metrics", index=False,
+                                          startrow=len(inputs_df)+2)
+            pay_df.reset_index().to_excel(writer, sheet_name="Simulated_Payoffs", index=False)
+        data_xlsx = output.getvalue()
+
+    st.download_button(
+        label="⬇️ Download Backtest Report (Excel, 2 tabs)",
+        data=data_xlsx,
+        file_name="Backtest_Report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_excel"
+    )
