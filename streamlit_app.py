@@ -1,4 +1,4 @@
-# streamlit_app.py — Backtester with EstVol (past) + ActualVol (future) in Debug
+# streamlit_app.py — Backtester with EstVol (past) + ActualVol (future) + Bollinger MR
 import os, io, time
 import numpy as np
 import pandas as pd
@@ -8,7 +8,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 # ----------------------- PAGE CONFIG (must be first Streamlit call) -----------------------
-st.set_page_config(page_title="Srini Backtester (Est vs Actual Vol)", layout="wide")
+st.set_page_config(page_title="Srini Backtester (Est vs Actual Vol + Bollinger)", layout="wide")
 
 # ----------------------- OPTIONAL AUTH -----------------------
 def _auth():
@@ -68,6 +68,13 @@ def compute_atr(df: pd.DataFrame, lb: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.ewm(alpha=1/lb, adjust=False).mean()
 
+def bollinger(price: pd.Series, window: int = 20, k: float = 2.0):
+    mid = price.rolling(window).mean()
+    sd  = price.rolling(window).std(ddof=0)
+    up  = mid + k * sd
+    lo  = mid - k * sd
+    return mid, up, lo
+
 # ----- Volatility measures: EstVol (past) and ActualVol (future) -----
 def realized_vol(returns: pd.Series, lookback: int = 20, ppy: int = 252):
     """Rolling historical (past) realized vol (annualized)."""
@@ -119,6 +126,35 @@ def composite_signal(price: pd.Series,
         hot = (atr_series/price).fillna(0) > atr_cap_pct
         comp[hot] = 0.0
     return comp.fillna(0.0)
+
+def bollinger_mr_signals(price: pd.Series, window: int = 20, k: float = 2.0) -> pd.Series:
+    """
+    Mean-reversion:
+      Long entry  : Close crosses UP through Lower band
+      Long exit   : Close crosses DOWN through Middle band
+      Short entry : Close crosses DOWN through Upper band
+      Short exit  : Close crosses UP through Middle band
+    """
+    mid, up, lo = bollinger(price, window, k)
+    long_ent  = (price.shift(1) < lo.shift(1)) & (price >= lo)
+    long_exit = (price.shift(1) > mid.shift(1)) & (price <= mid)
+    short_ent = (price.shift(1) > up.shift(1)) & (price <= up)
+    short_exit= (price.shift(1) < mid.shift(1)) & (price >= mid)
+
+    sig = pd.Series(0.0, index=price.index)
+    state = 0  # -1 short, 0 flat, +1 long
+    for i in range(1, len(price)):
+        if state == 0:
+            if long_ent.iloc[i]:
+                state = 1
+            elif short_ent.iloc[i]:
+                state = -1
+        elif state == 1 and long_exit.iloc[i]:
+            state = 0
+        elif state == -1 and short_exit.iloc[i]:
+            state = 0
+        sig.iloc[i] = state
+    return sig.fillna(0.0)
 
 # ----------------------- SIZING -----------------------
 def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy: int = 252) -> pd.Series:
@@ -234,10 +270,13 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
             use_and=params.get("use_and", False), use_macd=params.get("use_macd", True),
             atr_filter=params.get("atr_filter", False), atr_series=atr_s, atr_cap_pct=params.get("atr_cap_pct", 0.05),
         )
+    elif strategy == "Bollinger Mean Reversion":
+        sig = bollinger_mr_signals(price, params["bb_window"], params["bb_k"])
     else:
         raise ValueError("Unknown strategy")
 
-    if long_only: sig = sig.clip(lower=0.0)
+    if long_only:
+        sig = sig.clip(lower=0.0)
 
     # Vol targeting → position sizing
     est_vol = realized_vol(rets, lookback=20)                 # <-- EstVol (past)
@@ -347,7 +386,7 @@ def load_prices(tickers_raw: str, start, end) -> dict:
     return cleaned
 
 # ----------------------- UI -----------------------
-st.title("📊 Srini Backtester — EstVol vs ActualVol (SMA / RSI / Composite)")
+st.title("📊 Srini Backtester — EstVol vs ActualVol (SMA / RSI / Composite / Bollinger)")
 
 with st.sidebar:
     st.header("Backtest Settings")
@@ -355,7 +394,11 @@ with st.sidebar:
     start = st.date_input("Start", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end   = st.date_input("End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
-    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion", "Composite"], index=0)
+    strategy = st.selectbox(
+        "Strategy",
+        ["SMA Crossover", "RSI Mean Reversion", "Composite", "Bollinger Mean Reversion"],
+        index=0
+    )
 
     if strategy == "SMA Crossover":
         c1, c2 = st.columns(2)
@@ -368,7 +411,7 @@ with st.sidebar:
         rsi_buy = c2.number_input("RSI Buy <", 5, 50, 30, 1)
         rsi_sell = c3.number_input("RSI Sell >", 50, 95, 70, 1)
         params = {"rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell)}
-    else:
+    elif strategy == "Composite":
         f1, f2, f3 = st.columns(3)
         fast = f1.number_input("Fast SMA", 2, 200, 20, 1)
         slow = f2.number_input("Slow SMA", 5, 400, 200, 5)
@@ -388,6 +431,11 @@ with st.sidebar:
                   "rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell),
                   "use_macd": bool(use_macd), "use_and": combine_logic.startswith("AND"),
                   "atr_filter": bool(atr_filter), "atr_cap_pct": float(atr_cap)}
+    else:  # Bollinger MR
+        c1, c2 = st.columns(2)
+        bb_window = c1.number_input("BB Window", 5, 200, 20, 1)
+        bb_k      = c2.number_input("BB Std Dev (k)", 1.0, 4.0, 2.0, 0.5)
+        params = {"bb_window": int(bb_window), "bb_k": float(bb_k)}
 
     long_only  = st.checkbox("Long-only", value=True)
     vol_target = st.slider("Vol target (ann.)", 0.05, 0.40, 0.15, 0.01)
@@ -474,6 +522,26 @@ if run_btn:
                 ax.legend(loc="best"); ax.grid(True, alpha=0.3)
                 st.pyplot(fig, clear_figure=True)
 
+            # Bollinger price + bands + trade markers
+            if strategy == "Bollinger Mean Reversion":
+                close = df[price_col(df)]
+                mid, up, lo = bollinger(close, params["bb_window"], params["bb_k"])
+                sig = bollinger_mr_signals(close, params["bb_window"], params["bb_k"])
+                diff = sig.diff().fillna(0)
+                long_ent_idx  = diff[diff == 1].index
+                long_exit_idx = diff[diff == -1].index
+                # (If long_only==False, shorts are also taken by backtest; for brevity we mark long entries/exits.)
+
+                fig, ax = plt.subplots(figsize=(9,4))
+                ax.plot(df.index, close, label="Close")
+                ax.plot(df.index, mid,   label=f"BB Mid ({params['bb_window']})")
+                ax.plot(df.index, up,    label=f"BB Upper (k={params['bb_k']})")
+                ax.plot(df.index, lo,    label=f"BB Lower (k={params['bb_k']})")
+                ax.scatter(long_ent_idx,  close.reindex(long_ent_idx),  marker="^", s=60, label="Long Entry")
+                ax.scatter(long_exit_idx, close.reindex(long_exit_idx), marker="v", s=60, label="Long Exit")
+                ax.legend(loc="best"); ax.grid(True, alpha=0.3)
+                st.pyplot(fig, clear_figure=True)
+
             results.append({"Ticker": t, "RawCAGR": round(raw_cagr,4), **stats})
 
             # Collect debug rows
@@ -527,6 +595,8 @@ if run_btn:
             return strategy, {"RSI lookback": params.get("rsi_lb"),
                               "RSI Buy <": params.get("rsi_buy"),
                               "RSI Sell >": params.get("rsi_sell")}
+        elif strategy == "Bollinger Mean Reversion":
+            return strategy, {"BB Window": params.get("bb_window"), "BB k": params.get("bb_k")}
         else:
             return strategy, {
                 "Fast SMA": params.get("fast"), "Slow SMA": params.get("slow"),
