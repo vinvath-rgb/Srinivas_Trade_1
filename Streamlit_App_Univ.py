@@ -25,13 +25,17 @@ def _auth():
     pw = os.getenv("APP_PASSWORD", "")
     if not pw:
         return  # no auth configured
+    if "authed" not in st.session_state:
+        st.session_state["authed"] = False
     with st.sidebar:
         st.subheader("🔒 App Login")
         if not st.session_state["authed"]:
             entered = st.text_input("Password", type="password", key="auth_pw")
             if entered == pw:
                 st.session_state["authed"] = True
-                st.experimental_rerun()
+                st.rerun()
+            else:
+                st.error("X Wrong Password, Pls try again")
             st.stop()
 _auth()
 
