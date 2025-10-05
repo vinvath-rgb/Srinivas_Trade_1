@@ -1,16 +1,8 @@
-# streamlit_app.py — Integrated Universe (ETF+Stocks) + Backtester
-# ---------------------------------------------------------------
-# Tabs:
-# 1) Universe Builder (ETF & Stocks) -> sends tickers directly to Backtester
-# 2) Backtester (your existing engine, lightly refactored to accept session tickers)
-#
-# Notes:
-# - Uses Yahoo/Stooq loader you already had. If you later add Questrade/IBKR loaders,
-#   the Universe tab will automatically benefit (shared loader).
-# - Universe factors use price/volume only (no paid fundamentals needed).
-# - "Send to Backtester" buttons fill the Tickers box and switch to Backtester tab.
-#
-# ---------------------------------------------------------------
+# Srini_Integrated_Universe_Backtester.py
+# Filename-agnostic Streamlit app: Universe (ETF/Stocks/Both) + Backtester
+# - No st.switch_page calls (works regardless of filename)
+# - Universe results flow to Backtester via st.session_state
+# - Uses Yahoo/Stooq loader; later, you can plug in Questrade/IBKR without UI changes
 
 import os, io, time
 import numpy as np
@@ -53,6 +45,9 @@ def max_drawdown(eq: pd.Series):
     roll = eq.cummax(); dd = (eq/roll) - 1
     t = dd.idxmin(); p = roll.loc[:t].idxmax()
     return float(dd.min()), p, t
+
+def _to_list(s: str) -> list[str]:
+    return [t.strip().upper() for t in s.split(",") if t.strip()]
 
 # ----------------------- INDICATORS -----------------------
 def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
@@ -278,8 +273,8 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
     if debug:
         debug_df = pd.DataFrame({
             "Return": rets,
-            "EstVol": est_vol,        # past window (used by algo)
-            "ActualVol": act_vol,     # next window (what happened)
+            "EstVol": est_vol,
+            "ActualVol": act_vol,
             "Signal": sig,
             "Leverage": lev,
             "PreExecPosition": (sig * lev).shift(1)
@@ -355,14 +350,8 @@ def load_prices(tickers_raw: str, start, end) -> dict:
         if not d.empty: cleaned[t] = d
     return cleaned
 
-# =====================================================
-# ================  UNIVERSE TAB  =====================
-# =====================================================
-
-def _to_list(s: str) -> list[str]:
-    return [t.strip().upper() for t in s.split(",") if t.strip()]
-
-def pct_change(series: pd.Series, lookback_days: int) -> float:
+# ----------------------- UNIVERSE SCORING -----------------------
+def pct_change_lb(series: pd.Series, lookback_days: int) -> float:
     if len(series) < lookback_days + 1:
         return np.nan
     s = float(series.iloc[-(lookback_days+1)])
@@ -406,9 +395,9 @@ def score_universe(data: dict[str, pd.DataFrame],
         last_px = float(close.iloc[-1])
         adv = avg_dollar_vol(close, vol, lb=20)
         if (not np.isnan(last_px) and last_px >= min_price) and (not np.isnan(adv) and adv >= min_adv):
-            m12 = pct_change(close, mom_lookbacks[0])
-            m6  = pct_change(close, mom_lookbacks[1])
-            m3  = pct_change(close, mom_lookbacks[2])
+            m12 = pct_change_lb(close, mom_lookbacks[0])
+            m6  = pct_change_lb(close, mom_lookbacks[1])
+            m3  = pct_change_lb(close, mom_lookbacks[2])
             sma200 = sma_last(close, 200)
             trend = (last_px / sma200 - 1.0) if (not np.isnan(sma200) and sma200 > 0) else np.nan
             vol20 = realized_vol_last(close, 20)
@@ -451,14 +440,17 @@ def score_universe(data: dict[str, pd.DataFrame],
     dfm["Action"] = action
     return dfm.sort_values(["Action","Score","Ticker"], ascending=[True, False, True])
 
-# ====================== UI LAYOUT ======================
+# ----------------------- APP LAYOUT -----------------------
 st.title("🧭 Srini — Universe Builder + Backtester")
 
 tabs = st.tabs(["Universe", "Backtester"])
 
 # ----------------------- TAB 1: UNIVERSE -----------------------
 with tabs[0]:
-    st.subheader("Universe Builder (ETF & Stocks)")
+    st.subheader("Universe Builder")
+
+    # Choose ETF, Stocks, or Both
+    uni_type = st.radio("Universe Type", ["ETF", "Stocks", "Both"], index=2, horizontal=True)
 
     with st.expander("Time Window & Filters", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
@@ -477,86 +469,87 @@ with tabs[0]:
     with st.expander("Candidate Sets", expanded=True):
         default_etfs = "SPY, QQQ, IWM, DIA, XLK, XLF, XLE, XLI, XLP, XLY, XLU, XLB, XLV, XLC, XBI, SMH, ARKK, XIC.TO, XIU.TO, ZCN.TO, NIFTYBEES.NS, BANKBEES.NS"
         default_stks = "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, AMD, AVGO, COST, RY.TO, TD.TO, CNQ.TO, ENB.TO, SHOP.TO, RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS, ICICIBANK.NS"
+
         c1, c2 = st.columns(2)
-        etf_input = c1.text_area("ETF Candidates", value=default_etfs, height=120)
-        stk_input = c2.text_area("Stock Candidates", value=default_stks, height=120)
+        etf_input = c1.text_area("ETF Candidates", value=default_etfs, height=120, disabled=(uni_type=="Stocks"))
+        stk_input = c2.text_area("Stock Candidates", value=default_stks, height=120, disabled=(uni_type=="ETF"))
 
         c3, c4 = st.columns(2)
-        topN_etf = c3.number_input("Top N (ETF)", 1, 100, 10, 1)
-        topN_stk = c4.number_input("Top N (Stocks)", 1, 200, 20, 1)
+        topN_etf = c3.number_input("Top N (ETF)", 1, 100, 10, 1, disabled=(uni_type=="Stocks"))
+        topN_stk = c4.number_input("Top N (Stocks)", 1, 200, 20, 1, disabled=(uni_type=="ETF"))
 
-    run_u = st.button("🚀 Build Universes")
+    run_u = st.button("🚀 Build Universe")
 
     if run_u:
-        etfs = _to_list(etf_input)
-        stks = _to_list(stk_input)
+        etf_top = pd.DataFrame(); stk_top = pd.DataFrame()
 
-        with st.spinner("Downloading ETF prices..."):
-            etf_data = load_prices(", ".join(etfs), start_u, end_u)
-        with st.spinner("Scoring ETFs..."):
-            etf_df = score_universe(etf_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox)
+        if uni_type in ("ETF", "Both"):
+            etfs = _to_list(etf_input)
+            with st.spinner("Downloading ETF prices..."):
+                etf_data = load_prices(", ".join(etfs), start_u, end_u)
+            with st.spinner("Scoring ETFs..."):
+                etf_df = score_universe(etf_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox)
+            st.subheader("📦 ETF Recommendations")
+            if etf_df.empty:
+                st.warning("No ETFs passed filters.")
+            else:
+                etf_top = etf_df.sort_values("Score", ascending=False).head(topN_etf).copy()
+                st.dataframe(etf_top, use_container_width=True)
+                etf_csv = etf_top.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download ETF Picks (CSV)", etf_csv, "etf_universe.csv", "text/csv")
 
-        with st.spinner("Downloading Stock prices..."):
-            stk_data = load_prices(", ".join(stks), start_u, end_u)
-        with st.spinner("Scoring Stocks..."):
-            stk_df = score_universe(stk_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox)
+        if uni_type in ("Stocks", "Both"):
+            stks = _to_list(stk_input)
+            with st.spinner("Downloading Stock prices..."):
+                stk_data = load_prices(", ".join(stks), start_u, end_u)
+            with st.spinner("Scoring Stocks..."):
+                stk_df = score_universe(stk_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox)
+            st.subheader("💎 Stock Recommendations")
+            if stk_df.empty:
+                st.warning("No stocks passed filters.")
+            else:
+                stk_top = stk_df.sort_values("Score", ascending=False).head(topN_stk).copy()
+                st.dataframe(stk_top, use_container_width=True)
+                stk_csv = stk_top.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download Stock Picks (CSV)", stk_csv, "stock_universe.csv", "text/csv")
 
-        st.subheader("📦 ETF Recommendations")
-        if etf_df.empty:
-            st.warning("No ETFs passed filters.")
-            etf_top = pd.DataFrame()
-        else:
-            etf_top = etf_df.sort_values("Score", ascending=False).head(topN_etf).copy()
-            st.dataframe(etf_top, use_container_width=True)
-            etf_csv = etf_top.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download ETF Picks (CSV)", etf_csv, "etf_universe.csv", "text/csv")
-
-        st.subheader("💎 Stock Recommendations")
-        if stk_df.empty:
-            st.warning("No stocks passed filters.")
-            stk_top = pd.DataFrame()
-        else:
-            stk_top = stk_df.sort_values("Score", ascending=False).head(topN_stk).copy()
-            st.dataframe(stk_top, use_container_width=True)
-            stk_csv = stk_top.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download Stock Picks (CSV)", stk_csv, "stock_universe.csv", "text/csv")
-
-        # Buttons to send to Backtester
         st.markdown("---")
         c1, c2, c3 = st.columns(3)
-        if c1.button("➡️ Send ETF Picks to Backtester"):
+
+        def _send_notice_and_rerun(msg="Sent to Backtester ✔ — switch to the Backtester tab and hit Run."):
+            st.success(msg)
+            st.experimental_rerun()
+
+        if c1.button("➡️ Send ETF Picks to Backtester", disabled=etf_top.empty):
             st.session_state["universe_tickers_etf"] = ", ".join(etf_top["Ticker"].tolist()) if not etf_top.empty else ""
             st.session_state["universe_tickers_stock"] = st.session_state.get("universe_tickers_stock","")
             st.session_state["final_tickers"] = st.session_state["universe_tickers_etf"]
-            st.switch_page("streamlit_app.py")  # stay in same app; move to 2nd tab below by showing info banner
-        if c2.button("➡️ Send Stock Picks to Backtester"):
+            _send_notice_and_rerun()
+
+        if c2.button("➡️ Send Stock Picks to Backtester", disabled=stk_top.empty):
             st.session_state["universe_tickers_stock"] = ", ".join(stk_top["Ticker"].tolist()) if not stk_top.empty else ""
             st.session_state["universe_tickers_etf"] = st.session_state.get("universe_tickers_etf","")
             st.session_state["final_tickers"] = st.session_state["universe_tickers_stock"]
-            st.switch_page("streamlit_app.py")
-        if c3.button("➡️ Send BOTH (Merged) to Backtester"):
+            _send_notice_and_rerun()
+
+        if c3.button("➡️ Send BOTH (Merged) to Backtester", disabled=(etf_top.empty and stk_top.empty)):
             e = etf_top["Ticker"].tolist() if not etf_top.empty else []
             s = stk_top["Ticker"].tolist() if not stk_top.empty else []
-            merged = []
-            seen = set()
+            merged, seen = [], set()
             for x in e + s:
                 if x not in seen:
                     merged.append(x); seen.add(x)
             st.session_state["universe_tickers_etf"] = ", ".join(e)
             st.session_state["universe_tickers_stock"] = ", ".join(s)
             st.session_state["final_tickers"] = ", ".join(merged)
-            st.switch_page("streamlit_app.py")
-
-        st.info("After sending, switch to the **Backtester** tab below — the Tickers box will be auto-filled.")
+            _send_notice_and_rerun()
 
 # ----------------------- TAB 2: BACKTESTER -----------------------
 with tabs[1]:
     st.subheader("Backtester — EstVol vs ActualVol (SMA / RSI / Composite)")
 
-    # Sidebar-style controls inside this tab for compactness
-    c_top1, c_top2, c_top3 = st.columns([2,1,1])
-    # Use session tickers if present
     default_tickers = st.session_state.get("final_tickers", "SPY, XLK, ACN, XIC.TO")
+    c_top1, c_top2, c_top3 = st.columns([2,1,1])
     tickers = c_top1.text_input("Tickers (comma-separated)", value=default_tickers, key="bt_tickers")
     start_bt = c_top2.date_input("Start", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end_bt   = c_top3.date_input("End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
@@ -613,7 +606,6 @@ with tabs[1]:
 
     run_btn = st.button("▶️ Run Backtest")
 
-    # ----------------------- RUN -----------------------
     if run_btn:
         data = load_prices(tickers, start_bt, end_bt)
         if not data:
