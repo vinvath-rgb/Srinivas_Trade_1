@@ -299,3 +299,4 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end) -> dict:
     tickers
+    
