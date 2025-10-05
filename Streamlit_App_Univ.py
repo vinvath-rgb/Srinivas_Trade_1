@@ -1,6 +1,5 @@
 # streamlit_app.py
-# Srini — Universe Builder + Backtester (Render-friendly, auth-gated)
-
+# Srini — Universe Builder + Backtester (dynamic presets, reliable handoff, render-friendly)
 import os, io, time
 import numpy as np
 import pandas as pd
@@ -9,37 +8,38 @@ from pandas_datareader import data as pdr
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ─────────── App config ───────────
 st.set_page_config(page_title="Srini — Universe + Backtester", layout="wide")
 
-# Ensure keys exist (never None)
-if "bt_tickers" not in st.session_state:
-    st.session_state["bt_tickers"] = ""
-if "last_sent" not in st.session_state:
-    st.session_state["last_sent"] = ""
-if "authed" not in st.session_state:
-    st.session_state["authed"] = False
+# ─────────── session defaults ───────────
+for k, v in {
+    "authed": False,
+    "bt_tickers": "",
+    "last_sent": "",
+    "last_preview": [],
+    "ubuild_id": 0,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ─────────── Optional auth (hide app until correct password) ───────────
+# ─────────── optional auth ───────────
 def _auth():
     pw = os.getenv("APP_PASSWORD", "")
     if not pw:
-        return  # no auth configured
-    if "authed" not in st.session_state:
-        st.session_state["authed"] = False
+        return
     with st.sidebar:
         st.subheader("🔒 App Login")
         if not st.session_state["authed"]:
             entered = st.text_input("Password", type="password", key="auth_pw")
-            if entered == pw:
-                st.session_state["authed"] = True
-                st.rerun()
-            else:
-                st.error("X Wrong Password, Pls try again")
+            if entered:
+                if entered == pw:
+                    st.session_state["authed"] = True
+                    st.rerun()
+                else:
+                    st.error("❌ Wrong Password, please try again")
             st.stop()
 _auth()
 
-# ─────────── Utils ───────────
+# ─────────── utils ───────────
 def price_col(df): return "Adj Close" if "Adj Close" in df.columns else "Close"
 def _to_ts(d):     return pd.to_datetime(d).tz_localize(None)
 def _to_list(s: str) -> list[str]:
@@ -61,7 +61,7 @@ def max_drawdown(eq: pd.Series):
     t = dd.idxmin(); p = roll.loc[:t].idxmax()
     return float(dd.min()), p, t
 
-# ─────────── Indicators ───────────
+# ─────────── indicators ───────────
 def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     d = series.diff()
     up = d.clip(lower=0); dn = -d.clip(upper=0)
@@ -94,7 +94,7 @@ def realized_vol_series(returns: pd.Series, lookback: int = 20, ppy: int = 252):
 def future_realized_vol(returns: pd.Series, lookahead: int = 20, ppy: int = 252):
     return returns.rolling(lookahead).std().shift(-lookahead) * np.sqrt(ppy)
 
-# ─────────── Signals ───────────
+# ─────────── signals ───────────
 def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
     ma_f, ma_s = price.rolling(fast).mean(), price.rolling(slow).mean()
     sig = pd.Series(0.0, index=price.index)
@@ -136,7 +136,7 @@ def composite_signal(price: pd.Series,
         comp[hot] = 0.0
     return comp.fillna(0.0)
 
-# ─────────── Execution ───────────
+# ─────────── execution ───────────
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series,
                 atr_stop_mult: float, tp_mult: float,
                 trade_cost: float = 0.0, tax_rate: float = 0.0) -> pd.Series:
@@ -221,7 +221,7 @@ def simple_cagr(df: pd.DataFrame) -> float:
     yrs = max((df.index[-1]-df.index[0]).days/365.25, 1e-9)
     return (e/max(s,1e-12))**(1/yrs) - 1
 
-# ─────────── Backtest core ───────────
+# ─────────── backtest core ───────────
 def backtest(df: pd.DataFrame, strategy: str, params: dict,
              vol_target: float, long_only: bool, atr_stop: float, tp_mult: float,
              trade_cost: float=0.0, tax_rate: float=0.0,
@@ -293,7 +293,7 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 
     return equity, stats, debug_df, debug_summary
 
-# ─────────── Data loader (Yahoo + Stooq) ───────────
+# ─────────── data loader (Yahoo + Stooq) ───────────
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end) -> dict:
     tickers_input = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
@@ -350,7 +350,7 @@ def load_prices(tickers_raw: str, start, end) -> dict:
         if not d.empty: cleaned[t] = d
     return cleaned
 
-# ─────────── Universe factors & scoring ───────────
+# ─────────── universe scoring ───────────
 def pct_change_lb(series: pd.Series, lookback_days: int) -> float:
     if len(series) < lookback_days + 1:
         return np.nan
@@ -475,14 +475,50 @@ def score_universe(data: dict[str, pd.DataFrame],
 
     return dfm.sort_values(["Action","Score","Ticker"], ascending=[True, False, True])
 
-# ─────────── UI helpers ───────────
-def push_to_backtester(tickers_str: str):
-    st.session_state["final_tickers"] = tickers_str
+# ─────────── presets (static snapshots; you can expand later) ───────────
+US_LARGE = [
+    # ~50 prominent US tickers
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AVGO","COST","NFLX","AMD","CRM","ADBE",
+    "PEP","LIN","LLY","UNH","PG","V","MA","HD","KO","JNJ","BAC","XOM","WMT","CAT","MRK","ABBV",
+    "CVX","GE","INTC","CSCO","SBUX","NKE","PFE","MCD","ORCL","TXN","AMAT","QCOM","IBM","BA",
+    "BKNG","NOW","PANW","VRTX","COP","LOW","GS","AXP","TMO","LMT","DE"
+]
+CA_LARGE = [
+    # ~40 Canada tickers (Toronto Stock Exchange) - use .TO suffix
+    "RY.TO","TD.TO","BNS.TO","ENB.TO","CNQ.TO","BMO.TO","BCE.TO","CNR.TO","TRP.TO","SHOP.TO",
+    "SU.TO","FTS.TO","POW.TO","MFC.TO","IMO.TO","T.TO","ATD.TO","WCN.TO","NTR.TO","GIB-A.TO",
+    "BAM.TO","CM.TO","CP.TO","CVE.TO","QSR.TO","TECK-B.TO","FNV.TO","EMA.TO","H.TO","NA.TO",
+    "IFC.TO","TIH.TO","L.TO","BN.TO","WSP.TO","MG.TO","LNR.TO","TRI.TO","BIP-UN.TO","BCE.TO"
+]
+IN_LARGE = [
+    # ~40 India large caps (NSE) - use .NS suffix
+    "RELIANCE.NS","TCS.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","ITC.NS","LT.NS","SBIN.NS",
+    "BHARTIARTL.NS","KOTAKBANK.NS","HINDUNILVR.NS","BAJFINANCE.NS","ASIANPAINT.NS","M&M.NS",
+    "SUNPHARMA.NS","TITAN.NS","AXISBANK.NS","HCLTECH.NS","ONGC.NS","NTPC.NS","WIPRO.NS",
+    "NESTLEIND.NS","ULTRACEMCO.NS","TATASTEEL.NS","JSWSTEEL.NS","POWERGRID.NS","ADANIPORTS.NS",
+    "MARUTI.NS","COALINDIA.NS","BAJAJFINSV.NS","EICHERMOT.NS","TECHM.NS","HDFCLIFE.NS",
+    "GRASIM.NS","BRITANNIA.NS","BPCL.NS","HINDALCO.NS","UPL.NS","DIVISLAB.NS"
+]
+ETF_CORE = "SPY, QQQ, IWM, DIA, XLK, XLF, XLE, XLI, XLP, XLY, XLU, XLB, XLV, XLC, XBI, SMH, ARKK, XIC.TO, XIU.TO, ZCN.TO, NIFTYBEES.NS, BANKBEES.NS"
+
+def preset_list(region: str) -> str:
+    if region == "US large":
+        return ", ".join(US_LARGE)
+    if region == "Canada large":
+        return ", ".join(CA_LARGE)
+    if region == "India large":
+        return ", ".join(IN_LARGE)
+    return ""
+
+# ─────────── ui helpers ───────────
+def send_to_backtester(to_send: list[str]):
+    tickers_str = ", ".join(to_send)
     st.session_state["bt_tickers"] = tickers_str
     st.session_state["last_sent"] = tickers_str
-    st.toast("Sent to Backtester ✔ — switch to the Backtester tab and hit Run.")
+    st.success(f"Sent to Backtester: {tickers_str}")
+    st.rerun()
 
-# ─────────── Layout ───────────
+# ─────────── layout ───────────
 st.title("🧭 Srini — Universe Builder + Backtester")
 tab_univ, tab_bt = st.tabs(["Universe", "Backtester"])
 
@@ -491,6 +527,17 @@ with tab_univ:
     st.subheader("Universe Builder")
 
     uni_type = st.radio("Universe Type", ["ETF", "Stocks", "Both"], index=2, horizontal=True)
+
+    with st.expander("Candidate source", expanded=True):
+        src = st.selectbox("Source for Stocks", ["Manual", "US large", "Canada large", "India large"], index=1)
+        if src == "Manual":
+            default_stks = "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, AMD, AVGO, COST, RY.TO, TD.TO, CNQ.TO, ENB.TO, SHOP.TO, RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS, ICICIBANK.NS"
+        else:
+            default_stks = preset_list(src)
+        default_etfs = ETF_CORE
+        c1, c2 = st.columns(2)
+        etf_input = c1.text_area("ETF Candidates", value=default_etfs, height=120, disabled=(uni_type=="Stocks"))
+        stk_input = c2.text_area("Stock Candidates", value=default_stks, height=120, disabled=(uni_type=="ETF"))
 
     with st.expander("Time Window & Filters", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
@@ -507,13 +554,6 @@ with tab_univ:
         w_lv    = c3.slider("Low-Vol (favor calmer)", 0.0, 1.0, 0.2, 0.05)
         w_prox  = c4.slider("52W Proximity", 0.0, 1.0, 0.1, 0.05)
 
-    with st.expander("Candidate Sets", expanded=True):
-        default_etfs = "SPY, QQQ, IWM, DIA, XLK, XLF, XLE, XLI, XLP, XLY, XLU, XLB, XLV, XLC, XBI, SMH, ARKK, XIC.TO, XIU.TO, ZCN.TO, NIFTYBEES.NS, BANKBEES.NS"
-        default_stks = "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, AMD, AVGO, COST, RY.TO, TD.TO, CNQ.TO, ENB.TO, SHOP.TO, RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS, ICICIBANK.NS"
-        c1, c2 = st.columns(2)
-        etf_input = c1.text_area("ETF Candidates", value=default_etfs, height=120, disabled=(uni_type=="Stocks"))
-        stk_input = c2.text_area("Stock Candidates", value=default_stks, height=120, disabled=(uni_type=="ETF"))
-
     st.markdown("---")
     with st.expander("Send options", expanded=True):
         colA, colB, colC = st.columns([1,1,2])
@@ -524,16 +564,24 @@ with tab_univ:
     run_u = st.button("🚀 Build Universe")
 
     etf_top = pd.DataFrame(); stk_top = pd.DataFrame()
+    to_send = []
     if run_u:
+        # force fresh build & show build id
+        st.cache_data.clear()
+        st.session_state["ubuild_id"] += 1
+
+        def _clip(df: pd.DataFrame, s, e):
+            return df.loc[_to_ts(s):_to_ts(e)]
+
         if uni_type in ("ETF", "Both"):
             etfs = _to_list(etf_input)
             with st.spinner("Downloading ETF prices..."):
                 etf_data = load_prices(", ".join(etfs), start_u, end_u)
+                etf_data = {t: _clip(df, start_u, end_u) for t, df in etf_data.items()}
             with st.spinner("Scoring ETFs..."):
                 etf_df = score_universe(etf_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox, auto_adapt_lookbacks=auto_adapt)
             st.subheader("📦 ETF Recommendations")
-            if etf_df.empty:
-                st.warning("No ETFs passed filters.")
+            if etf_df.empty: st.warning("No ETFs passed filters.")
             else:
                 st.dataframe(etf_df, use_container_width=True)
                 etf_top = etf_df.copy()
@@ -542,11 +590,11 @@ with tab_univ:
             stks = _to_list(stk_input)
             with st.spinner("Downloading Stock prices..."):
                 stk_data = load_prices(", ".join(stks), start_u, end_u)
+                stk_data = {t: _clip(df, start_u, end_u) for t, df in stk_data.items()}
             with st.spinner("Scoring Stocks..."):
                 stk_df = score_universe(stk_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox, auto_adapt_lookbacks=auto_adapt)
             st.subheader("💎 Stock Recommendations")
-            if stk_df.empty:
-                st.warning("No stocks passed filters.")
+            if stk_df.empty: st.warning("No stocks passed filters.")
             else:
                 st.dataframe(stk_df, use_container_width=True)
                 stk_top = stk_df.copy()
@@ -557,40 +605,45 @@ with tab_univ:
             df2 = df[df["Action"].isin(allowed)].sort_values("Score", ascending=False)
             return df2["Ticker"].tolist()[:max_send]
 
-        to_send = []
-        if uni_type in ("ETF", "Both"):
-            to_send += select_for_sending(etf_top)
-        if uni_type in ("Stocks", "Both"):
-            to_send += select_for_sending(stk_top)
+        if uni_type in ("ETF", "Both"):   to_send += select_for_sending(etf_top)
+        if uni_type in ("Stocks", "Both"): to_send += select_for_sending(stk_top)
 
-        # De-dupe preserving order
+        # dedupe preserving order
         seen = set(); dedup = []
         for t in to_send:
             if t not in seen:
                 dedup.append(t); seen.add(t)
         to_send = dedup
 
+        # store preview in session so it survives reruns
+        st.session_state["last_preview"] = to_send[:]
+
         if to_send:
             preview_placeholder.markdown("**Preview (to Backtester):** " + ", ".join(to_send))
         else:
-            preview_placeholder.info("Nothing to send yet — extend date range, lower filters, or include WATCH.")
+            preview_placeholder.info("Nothing to send — widen dates, include WATCH, or relax filters.")
 
-        st.markdown("---")
-        if st.button("➡️ Send to Backtester", disabled=(len(to_send)==0)):
-            push_to_backtester(", ".join(to_send))
+        st.caption(
+            f"✅ Built #{st.session_state['ubuild_id']} · Window: {start_u} → {end_u} · "
+            f"MinPx: {min_px} · MinADV20: {min_adv:,.0f} · Preview count: {len(to_send)}"
+        )
+
+    # the send button is OUTSIDE the build-block → always available
+    with st.container():
+        if st.button("➡️ Send to Backtester", disabled=(len(st.session_state['last_preview']) == 0)):
+            send_to_backtester(st.session_state["last_preview"])
 
 # ===== Backtester =====
 with tab_bt:
     st.subheader("Backtester — EstVol vs ActualVol (SMA / RSI / Composite)")
-
     if st.session_state["last_sent"]:
         st.info(f"Tickers received from Universe: {st.session_state['last_sent']}")
 
-    if "bt_tickers" not in st.session_state or not st.session_state["bt_tickers"].strip():
-        st.session_state["bt_tickers"] = st.session_state.get("final_tickers", "SPY, XLK, ACN, XIC.TO")
+    if not st.session_state["bt_tickers"]:
+        st.session_state["bt_tickers"] = "SPY, XLK, ACN, XIC.TO"
+    tickers = st.text_input("Tickers (comma-separated)", key="bt_tickers")  # key-only binding
 
-    c_top1, c_top2, c_top3 = st.columns([2,1,1])
-    tickers = c_top1.text_input("Tickers (comma-separated)", key="bt_tickers")
+    c_top2, c_top3 = st.columns(2)
     start_bt = c_top2.date_input("Start", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end_bt   = c_top3.date_input("End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
