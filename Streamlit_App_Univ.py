@@ -1,10 +1,5 @@
-# Srini_Integrated_Universe_Backtester.py
-# One-file, filename-agnostic Streamlit app:
-# - Universe Builder (ETF/Stocks/Both) with BUY/WATCH/AVOID
-# - Send-to-Backtester sends BUY (default) + optional WATCH (checkbox)
-# - Render-friendly: no switch_page; uses st.session_state["bt_tickers"]
-# - Backtester with SMA/RSI/Composite, vol-targeting, ATR stops/TP, Excel export
-# - Yahoo first, Stooq fallback (.TO/.V for Canada; .NS for India)
+# streamlit_app.py
+# Srini — Universe Builder + Backtester (Render-friendly, auth-gated)
 
 import os, io, time
 import numpy as np
@@ -14,28 +9,33 @@ from pandas_datareader import data as pdr
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ───────────────────── PAGE CONFIG / OPTIONAL AUTH ─────────────────────
+# ─────────── App config ───────────
 st.set_page_config(page_title="Srini — Universe + Backtester", layout="wide")
 
+# Ensure keys exist (never None)
+if "bt_tickers" not in st.session_state:
+    st.session_state["bt_tickers"] = ""
+if "last_sent" not in st.session_state:
+    st.session_state["last_sent"] = ""
+if "authed" not in st.session_state:
+    st.session_state["authed"] = False
+
+# ─────────── Optional auth (hide app until correct password) ───────────
 def _auth():
     pw = os.getenv("APP_PASSWORD", "")
     if not pw:
-        return
+        return  # no auth configured
     with st.sidebar:
         st.subheader("🔒 App Login")
-        if st.text_input("Password", type="password", key="auth_pw") != pw:
+        if not st.session_state["authed"]:
+            entered = st.text_input("Password", type="password", key="auth_pw")
+            if entered == pw:
+                st.session_state["authed"] = True
+                st.experimental_rerun()
             st.stop()
 _auth()
 
-# Live session monitor (helps verify Send ➜ Backtester on Render)
-with st.sidebar:
-    st.caption("🔎 Live session state")
-    st.write({
-        "last_sent": st.session_state.get("last_sent"),
-        "bt_tickers": st.session_state.get("bt_tickers"),
-    })
-
-# ───────────────────── SHARED UTILS ─────────────────────
+# ─────────── Utils ───────────
 def price_col(df): return "Adj Close" if "Adj Close" in df.columns else "Close"
 def _to_ts(d):     return pd.to_datetime(d).tz_localize(None)
 def _to_list(s: str) -> list[str]:
@@ -57,7 +57,7 @@ def max_drawdown(eq: pd.Series):
     t = dd.idxmin(); p = roll.loc[:t].idxmax()
     return float(dd.min()), p, t
 
-# ───────────────────── INDICATORS ─────────────────────
+# ─────────── Indicators ───────────
 def rsi(series: pd.Series, lb: int = 14) -> pd.Series:
     d = series.diff()
     up = d.clip(lower=0); dn = -d.clip(upper=0)
@@ -90,7 +90,7 @@ def realized_vol_series(returns: pd.Series, lookback: int = 20, ppy: int = 252):
 def future_realized_vol(returns: pd.Series, lookahead: int = 20, ppy: int = 252):
     return returns.rolling(lookahead).std().shift(-lookahead) * np.sqrt(ppy)
 
-# ───────────────────── SIGNALS ─────────────────────
+# ─────────── Signals ───────────
 def sma_signals(price: pd.Series, fast: int, slow: int) -> pd.Series:
     ma_f, ma_s = price.rolling(fast).mean(), price.rolling(slow).mean()
     sig = pd.Series(0.0, index=price.index)
@@ -132,13 +132,7 @@ def composite_signal(price: pd.Series,
         comp[hot] = 0.0
     return comp.fillna(0.0)
 
-# ───────────────────── SIZING & EXECUTION ─────────────────────
-def position_sizer(signal: pd.Series, returns: pd.Series, vol_target: float, ppy: int = 252) -> pd.Series:
-    vol = returns.ewm(span=20, adjust=False).std() * np.sqrt(ppy)
-    vol.replace(0, np.nan, inplace=True)
-    lev = (vol_target / (vol + 1e-12)).clip(upper=5.0).fillna(0.0)
-    return signal * lev
-
+# ─────────── Execution ───────────
 def apply_stops(df: pd.DataFrame, pos: pd.Series, atr: pd.Series,
                 atr_stop_mult: float, tp_mult: float,
                 trade_cost: float = 0.0, tax_rate: float = 0.0) -> pd.Series:
@@ -223,7 +217,7 @@ def simple_cagr(df: pd.DataFrame) -> float:
     yrs = max((df.index[-1]-df.index[0]).days/365.25, 1e-9)
     return (e/max(s,1e-12))**(1/yrs) - 1
 
-# ───────────────────── BACKTEST CORE ─────────────────────
+# ─────────── Backtest core ───────────
 def backtest(df: pd.DataFrame, strategy: str, params: dict,
              vol_target: float, long_only: bool, atr_stop: float, tp_mult: float,
              trade_cost: float=0.0, tax_rate: float=0.0,
@@ -295,8 +289,509 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 
     return equity, stats, debug_df, debug_summary
 
-# ───────────────────── DATA LOADER (Yahoo + Stooq) ─────────────────────
+# ─────────── Data loader (Yahoo + Stooq) ───────────
 @st.cache_data(show_spinner=False)
 def load_prices(tickers_raw: str, start, end) -> dict:
-    tickers
-    
+    tickers_input = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    if not tickers_input: return {}
+    start = _to_ts(start); end = _to_ts(end); end_inc = end + pd.Timedelta(days=1)
+
+    results = {}
+
+    def try_yahoo(sym: str):
+        try:
+            df = yf.download(sym, start=start, end=end_inc, interval="1d",
+                             auto_adjust=False, progress=False, threads=False, timeout=60)
+            if df is not None and not df.empty:
+                keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]
+                df = df[keep].sort_index().dropna(how="all")
+                return df if not df.empty else None
+        except Exception:
+            return None
+        return None
+
+    def try_stooq(sym: str):
+        try:
+            df = pdr.DataReader(sym, "stooq", start=start, end=end_inc)
+            if df is not None and not df.empty:
+                df = df.sort_index()
+                if "Adj Close" not in df.columns and "Close" in df.columns:
+                    df["Adj Close"] = df["Close"]
+                keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]
+                df = df[keep].dropna(how="all")
+                return df if not df.empty else None
+        except Exception:
+            return None
+        return None
+
+    for orig in tickers_input:
+        candidates = [orig] if "." in orig else [orig, f"{orig}.TO", f"{orig}.V"]
+        df_ok = None
+        for cand in candidates:
+            df_ok = try_yahoo(cand)
+            if df_ok is not None:
+                results[orig] = df_ok; break
+            time.sleep(0.2)
+        if df_ok is None:
+            df_ok = try_stooq(orig)
+            if df_ok is not None:
+                results[orig] = df_ok
+            time.sleep(0.2)
+
+    cleaned = {}
+    for t, d in results.items():
+        if d is None or d.empty: continue
+        keep = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in d.columns]
+        d = d[keep].sort_index().dropna(how="all")
+        if not d.empty: cleaned[t] = d
+    return cleaned
+
+# ─────────── Universe factors & scoring ───────────
+def pct_change_lb(series: pd.Series, lookback_days: int) -> float:
+    if len(series) < lookback_days + 1:
+        return np.nan
+    s = float(series.iloc[-(lookback_days+1)])
+    e = float(series.iloc[-1])
+    return (e / s - 1.0) if s > 0 else np.nan
+
+def realized_vol_last(series: pd.Series, lb: int = 20) -> float:
+    rr = series.pct_change()
+    if rr.dropna().empty:
+        return np.nan
+    return float(rr.rolling(lb).std().iloc[-1])
+
+def avg_dollar_vol(close: pd.Series, volume: pd.Series, lb: int = 20) -> float:
+    if close.dropna().empty or volume.dropna().empty:
+        return np.nan
+    adv = (close * volume).rolling(lb).mean().iloc[-1]
+    return float(adv) if pd.notna(adv) else np.nan
+
+def sma_last(series: pd.Series, lb: int = 200) -> float:
+    if len(series) < lb:
+        return np.nan
+    return float(series.rolling(lb).mean().iloc[-1])
+
+def near_52w_high(price: pd.Series, window: int = 252) -> float:
+    if len(price) < window:
+        return np.nan
+    high = float(price.iloc[-window:].max())
+    last = float(price.iloc[-1])
+    return last / high if high > 0 else np.nan
+
+def score_universe(data: dict[str, pd.DataFrame],
+                   min_price: float, min_adv: float,
+                   w_mom: float, w_trend: float, w_lowvol: float, w_prox: float,
+                   auto_adapt_lookbacks: bool = True,
+                   base_lookbacks=(252-21, 126-21, 63-21)) -> pd.DataFrame:
+    rows = []
+    for t, df in data.items():
+        close = df[price_col(df)].dropna()
+        vol   = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(index=close.index, dtype=float)
+        if close.empty:
+            continue
+
+        L = len(close)
+        lb12, lb6, lb3 = base_lookbacks
+        if auto_adapt_lookbacks:
+            lb12 = max(min(lb12, max(L - 21, 0)), 40) if L > 60 else np.nan
+            lb6  = max(min(lb6,  max(L - 21, 0)), 30) if L > 50 else np.nan
+            lb3  = max(min(lb3,  max(L - 21, 0)), 20) if L > 40 else np.nan
+
+        last_px = float(close.iloc[-1])
+        adv = avg_dollar_vol(close, vol, lb=20)
+        if (not np.isnan(last_px) and last_px >= min_price) and (not np.isnan(adv) and adv >= min_adv):
+            m12 = pct_change_lb(close, int(lb12)) if not np.isnan(lb12) else np.nan
+            m6  = pct_change_lb(close, int(lb6))  if not np.isnan(lb6)  else np.nan
+            m3  = pct_change_lb(close, int(lb3))  if not np.isnan(lb3)  else np.nan
+
+            sma200 = sma_last(close, 200)
+            if np.isnan(sma200):
+                sma200 = sma_last(close, 50)
+            trend = (last_px / sma200 - 1.0) if (not np.isnan(sma200) and sma200 > 0) else np.nan
+
+            vol20 = realized_vol_last(close, 20)
+            inv_vol = (1.0 / vol20) if (vol20 and vol20 > 0) else np.nan
+
+            prox_w = min(L, 252)
+            prox = near_52w_high(close, prox_w) if L >= 20 else np.nan
+
+            rows.append({
+                "Ticker": t,
+                "Last": round(last_px, 4),
+                "ADV20": round(adv, 2) if adv is not None else np.nan,
+                "Mom12_1": m12, "Mom6_1": m6, "Mom3_1": m3,
+                "Trend200": trend,
+                "InvVol20": inv_vol,
+                "Prox52W": prox
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["Ticker","Last","ADV20","Mom12_1","Mom6_1","Mom3_1","Trend200","InvVol20","Prox52W","Score","Action"])
+
+    dfm = pd.DataFrame(rows)
+
+    def pct_rank(col):
+        return col.rank(pct=True, na_option="keep")
+
+    # Momentum blend
+    comp = []
+    if dfm["Mom12_1"].notna().any(): comp.append((pct_rank(dfm["Mom12_1"]), 0.5))
+    if dfm["Mom6_1"].notna().any():  comp.append((pct_rank(dfm["Mom6_1"]), 0.3))
+    if dfm["Mom3_1"].notna().any():  comp.append((pct_rank(dfm["Mom3_1"]), 0.2))
+    if comp:
+        total_w = sum(w for _, w in comp)
+        mom_score = sum(z*w for z,w in comp) / (total_w if total_w>0 else 1.0)
+    else:
+        mom_score = pd.Series(np.nan, index=dfm.index)
+
+    z_trend = pct_rank(dfm["Trend200"]) if dfm["Trend200"].notna().any() else pd.Series(np.nan, index=dfm.index)
+    z_inv   = pct_rank(dfm["InvVol20"]) if dfm["InvVol20"].notna().any() else pd.Series(np.nan, index=dfm.index)
+    z_prox  = pct_rank(dfm["Prox52W"])  if dfm["Prox52W"].notna().any()  else pd.Series(np.nan, index=dfm.index)
+
+    scores = []
+    for i in dfm.index:
+        parts = []
+        if not np.isnan(mom_score.iloc[i]): parts.append(w_mom   * mom_score.iloc[i])
+        if not np.isnan(z_trend.iloc[i]):   parts.append(w_trend * z_trend.iloc[i])
+        if not np.isnan(z_inv.iloc[i]):     parts.append(w_lowvol* z_inv.iloc[i])
+        if not np.isnan(z_prox.iloc[i]):    parts.append(w_prox  * z_prox.iloc[i])
+        scores.append(np.round(sum(parts), 4) if parts else np.nan)
+
+    dfm["Score"] = scores
+
+    valid = dfm["Score"].notna()
+    if valid.any():
+        p = dfm.loc[valid, "Score"].rank(pct=True)
+        action = pd.Series("AVOID", index=dfm.index, dtype=object)
+        action.loc[valid & (p >= 0.8)] = "BUY"
+        action.loc[valid & (p >= 0.6) & (p < 0.8)] = "WATCH"
+        dfm["Action"] = action
+    else:
+        dfm["Action"] = "AVOID"
+
+    return dfm.sort_values(["Action","Score","Ticker"], ascending=[True, False, True])
+
+# ─────────── UI helpers ───────────
+def push_to_backtester(tickers_str: str):
+    st.session_state["final_tickers"] = tickers_str
+    st.session_state["bt_tickers"] = tickers_str
+    st.session_state["last_sent"] = tickers_str
+    st.toast("Sent to Backtester ✔ — switch to the Backtester tab and hit Run.")
+
+# ─────────── Layout ───────────
+st.title("🧭 Srini — Universe Builder + Backtester")
+tab_univ, tab_bt = st.tabs(["Universe", "Backtester"])
+
+# ===== Universe =====
+with tab_univ:
+    st.subheader("Universe Builder")
+
+    uni_type = st.radio("Universe Type", ["ETF", "Stocks", "Both"], index=2, horizontal=True)
+
+    with st.expander("Time Window & Filters", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        start_u = c1.date_input("History Start", value=pd.to_datetime("2018-01-01")).strftime("%Y-%m-%d")
+        end_u   = c2.date_input("History End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
+        min_px  = c3.number_input("Min Price", 0.0, 10000.0, 5.0, 0.5)
+        min_adv = c4.number_input("Min Avg Dollar Volume (20d)", 0.0, 1e12, 5_000_000.0, 100_000.0)
+        auto_adapt = st.checkbox("Auto-adapt lookbacks when history is short", value=True)
+
+    with st.expander("Factor Weights", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        w_mom   = c1.slider("Momentum", 0.0, 1.0, 0.5, 0.05)
+        w_trend = c2.slider("Trend (SMA200)", 0.0, 1.0, 0.2, 0.05)
+        w_lv    = c3.slider("Low-Vol (favor calmer)", 0.0, 1.0, 0.2, 0.05)
+        w_prox  = c4.slider("52W Proximity", 0.0, 1.0, 0.1, 0.05)
+
+    with st.expander("Candidate Sets", expanded=True):
+        default_etfs = "SPY, QQQ, IWM, DIA, XLK, XLF, XLE, XLI, XLP, XLY, XLU, XLB, XLV, XLC, XBI, SMH, ARKK, XIC.TO, XIU.TO, ZCN.TO, NIFTYBEES.NS, BANKBEES.NS"
+        default_stks = "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, AMD, AVGO, COST, RY.TO, TD.TO, CNQ.TO, ENB.TO, SHOP.TO, RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS, ICICIBANK.NS"
+        c1, c2 = st.columns(2)
+        etf_input = c1.text_area("ETF Candidates", value=default_etfs, height=120, disabled=(uni_type=="Stocks"))
+        stk_input = c2.text_area("Stock Candidates", value=default_stks, height=120, disabled=(uni_type=="ETF"))
+
+    st.markdown("---")
+    with st.expander("Send options", expanded=True):
+        colA, colB, colC = st.columns([1,1,2])
+        include_watch = colA.checkbox("Include WATCH", value=False)
+        max_send = int(colB.number_input("Max tickers to send", 1, 500, 25, 1))
+        preview_placeholder = colC.empty()
+
+    run_u = st.button("🚀 Build Universe")
+
+    etf_top = pd.DataFrame(); stk_top = pd.DataFrame()
+    if run_u:
+        if uni_type in ("ETF", "Both"):
+            etfs = _to_list(etf_input)
+            with st.spinner("Downloading ETF prices..."):
+                etf_data = load_prices(", ".join(etfs), start_u, end_u)
+            with st.spinner("Scoring ETFs..."):
+                etf_df = score_universe(etf_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox, auto_adapt_lookbacks=auto_adapt)
+            st.subheader("📦 ETF Recommendations")
+            if etf_df.empty:
+                st.warning("No ETFs passed filters.")
+            else:
+                st.dataframe(etf_df, use_container_width=True)
+                etf_top = etf_df.copy()
+
+        if uni_type in ("Stocks", "Both"):
+            stks = _to_list(stk_input)
+            with st.spinner("Downloading Stock prices..."):
+                stk_data = load_prices(", ".join(stks), start_u, end_u)
+            with st.spinner("Scoring Stocks..."):
+                stk_df = score_universe(stk_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox, auto_adapt_lookbacks=auto_adapt)
+            st.subheader("💎 Stock Recommendations")
+            if stk_df.empty:
+                st.warning("No stocks passed filters.")
+            else:
+                st.dataframe(stk_df, use_container_width=True)
+                stk_top = stk_df.copy()
+
+        def select_for_sending(df):
+            if df.empty: return []
+            allowed = ["BUY"] + (["WATCH"] if include_watch else [])
+            df2 = df[df["Action"].isin(allowed)].sort_values("Score", ascending=False)
+            return df2["Ticker"].tolist()[:max_send]
+
+        to_send = []
+        if uni_type in ("ETF", "Both"):
+            to_send += select_for_sending(etf_top)
+        if uni_type in ("Stocks", "Both"):
+            to_send += select_for_sending(stk_top)
+
+        # De-dupe preserving order
+        seen = set(); dedup = []
+        for t in to_send:
+            if t not in seen:
+                dedup.append(t); seen.add(t)
+        to_send = dedup
+
+        if to_send:
+            preview_placeholder.markdown("**Preview (to Backtester):** " + ", ".join(to_send))
+        else:
+            preview_placeholder.info("Nothing to send yet — extend date range, lower filters, or include WATCH.")
+
+        st.markdown("---")
+        if st.button("➡️ Send to Backtester", disabled=(len(to_send)==0)):
+            push_to_backtester(", ".join(to_send))
+
+# ===== Backtester =====
+with tab_bt:
+    st.subheader("Backtester — EstVol vs ActualVol (SMA / RSI / Composite)")
+
+    if st.session_state["last_sent"]:
+        st.info(f"Tickers received from Universe: {st.session_state['last_sent']}")
+
+    if "bt_tickers" not in st.session_state or not st.session_state["bt_tickers"].strip():
+        st.session_state["bt_tickers"] = st.session_state.get("final_tickers", "SPY, XLK, ACN, XIC.TO")
+
+    c_top1, c_top2, c_top3 = st.columns([2,1,1])
+    tickers = c_top1.text_input("Tickers (comma-separated)", key="bt_tickers")
+    start_bt = c_top2.date_input("Start", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
+    end_bt   = c_top3.date_input("End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
+
+    strategy = st.selectbox("Strategy", ["SMA Crossover", "RSI Mean Reversion", "Composite"], index=0)
+
+    if strategy == "SMA Crossover":
+        c1, c2 = st.columns(2)
+        fast = c1.number_input("Fast SMA", 2, 200, 20, 1)
+        slow = c2.number_input("Slow SMA", 5, 400, 100, 5)
+        params = {"fast": int(fast), "slow": int(slow)}
+    elif strategy == "RSI Mean Reversion":
+        c1, c2, c3 = st.columns(3)
+        rsi_lb = c1.number_input("RSI lookback", 2, 100, 14, 1)
+        rsi_buy = c2.number_input("RSI Buy <", 5, 50, 30, 1)
+        rsi_sell = c3.number_input("RSI Sell >", 50, 95, 70, 1)
+        params = {"rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell)}
+    else:
+        f1, f2, f3 = st.columns(3)
+        fast = f1.number_input("Fast SMA", 2, 200, 20, 1)
+        slow = f2.number_input("Slow SMA", 5, 400, 200, 5)
+        use_macd = f3.checkbox("Use MACD", value=True)
+
+        r1, r2, r3 = st.columns(3)
+        rsi_lb   = r1.number_input("RSI lookback", 2, 100, 14, 1)
+        rsi_buy  = r2.number_input("RSI Buy <", 5, 50, 30, 1)
+        rsi_sell = r3.number_input("RSI Sell >", 50, 95, 70, 1)
+
+        g1, g2, g3 = st.columns(3)
+        combine_logic = g1.selectbox("Combine", ["AND (strict)", "Voting (≥2)"], index=1)
+        atr_filter = g2.checkbox("ATR 'too hot' filter", value=False)
+        atr_cap    = g3.number_input("Max ATR/Price on entry", 0.01, 0.20, 0.05, 0.01)
+
+        params = {"fast": int(fast), "slow": int(slow),
+                  "rsi_lb": int(rsi_lb), "rsi_buy": int(rsi_buy), "rsi_sell": int(rsi_sell),
+                  "use_macd": bool(use_macd), "use_and": combine_logic.startswith("AND"),
+                  "atr_filter": bool(atr_filter), "atr_cap_pct": float(atr_cap)}
+
+    c2b1, c2b2, c2b3 = st.columns(3)
+    long_only  = c2b1.checkbox("Long-only", value=True)
+    vol_target = c2b2.slider("Vol target (ann.)", 0.05, 0.40, 0.15, 0.01)
+    atr_stop   = c2b3.slider("ATR Stop (×)", 1.0, 8.0, 3.0, 0.5)
+
+    c3b1, c3b2, c3b3 = st.columns(3)
+    tp_mult    = c3b1.slider("Take Profit (× ATR)", 2.0, 10.0, 6.0, 0.5)
+    trade_cost = c3b2.number_input("Cost per trade (%)", 0.0, 0.50, 0.05, 0.01) / 100.0
+    tax_rate   = c3b3.number_input("Effective tax on gains (%)", 0.0, 50.0, 0.0, 1.0) / 100.0
+
+    lot_size = st.number_input("Lot size for payoff (sh/ticker)", 1, 100000, 100)
+
+    st.markdown("---")
+    debug_mode = st.checkbox("Run Debug Mode (log EstVol/ActualVol)", value=True)
+    include_debug_in_excel = st.checkbox("Include Debug sheets in Excel", value=True)
+
+    run_btn = st.button("▶️ Run Backtest")
+
+    if run_btn:
+        data = load_prices(tickers, start_bt, end_bt)
+        if not data:
+            st.error("No data downloaded. Try adding exchange suffixes (.TO for Canada, .NS for India).")
+            st.stop()
+
+        st.subheader("🔎 Data Check")
+        in_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+        rows = []
+        for t in in_list:
+            d = data.get(t)
+            if d is None or d.empty:
+                hint = "" if "." in t else "Try .TO (e.g., XIC.TO) or .NS (e.g., TCS.NS)."
+                rows.append({"Ticker": t, "Status": "NO DATA", "Rows": 0, "First": "", "Last": "", "Hint": hint})
+            else:
+                rows.append({"Ticker": t, "Status": "OK", "Rows": int(len(d)),
+                             "First": str(d.index.min().date()), "Last": str(d.index.max().date()), "Hint": ""})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+        results = []
+        all_debug_rows = []
+        all_dbg_summ = []
+
+        subtabs = st.tabs(list(data.keys()))
+        for tab, t in zip(subtabs, data.keys()):
+            with tab:
+                df = data[t]
+                st.write(f"{t}: {len(df)} rows · {df.index.min().date()} → {df.index.max().date()}")
+
+                equity, stats, dbg_df, dbg_sum = backtest(
+                    df, strategy, params, vol_target, long_only, atr_stop, tp_mult,
+                    trade_cost=trade_cost, tax_rate=tax_rate,
+                    debug=debug_mode
+                )
+
+                st.subheader(f"{t} — Equity Curve")
+                st.line_chart(equity, height=300)
+
+                raw_cagr = simple_cagr(df)
+                st.markdown(
+                    f"**Buy & Hold CAGR:** {raw_cagr:.2%}  |  "
+                    f"**Strategy CAGR:** {stats['CAGR']:.2%}  |  "
+                    f"**Sharpe:** {stats['Sharpe']:.2f}  |  "
+                    f"**MaxDD:** {stats['MaxDD']:.2%}  |  "
+                    f"**Exposure:** {stats['Exposure']:.0%}  |  "
+                    f"**Entries/Exits/Flips:** {stats['Trades_Entered']}/{stats['Trades_Exited']}/{stats['Flips']}  |  "
+                    f"**Total Costs:** {stats['TotalCosts(%)']:.3f}%"
+                )
+
+                if strategy == "SMA Crossover":
+                    close = df[price_col(df)]
+                    ma_f = close.rolling(params["fast"]).mean()
+                    ma_s = close.rolling(params["slow"]).mean()
+                    bull = (ma_f.shift(1) <= ma_s.shift(1)) & (ma_f > ma_s)
+                    bear = (ma_f.shift(1) >= ma_s.shift(1)) & (ma_f < ma_s)
+                    fig, ax = plt.subplots(figsize=(9,4))
+                    ax.plot(df.index, close, label="Close")
+                    ax.plot(df.index, ma_f, label=f"SMA {params['fast']}")
+                    ax.plot(df.index, ma_s, label=f"SMA {params['slow']}")
+                    ax.scatter(df.index[bull], close[bull], marker="^", s=60, label="Bullish Cross")
+                    ax.scatter(df.index[bear], close[bear], marker="v", s=60, label="Bearish Cross")
+                    ax.legend(loc="best"); ax.grid(True, alpha=0.3)
+                    st.pyplot(fig, clear_figure=True)
+
+                results.append({"Ticker": t, "RawCAGR": round(raw_cagr,4), **stats})
+
+                if debug_mode and dbg_df is not None and not dbg_df.empty:
+                    dcopy = dbg_df.copy(); dcopy.insert(0, "Ticker", t)
+                    all_debug_rows.append(dcopy)
+                    if dbg_sum:
+                        for row in dbg_sum:
+                            row["Ticker"] = t
+                        all_dbg_summ += dbg_sum
+
+        res_df = pd.DataFrame(results).set_index("Ticker")
+        res_df["CAGR Δ (Strat − Raw)"] = (res_df["CAGR"] - res_df["RawCAGR"]).round(4)
+        st.subheader("📋 Metrics Summary")
+        st.dataframe(res_df, use_container_width=True)
+
+        pay_rows = []
+        for t in res_df.index:
+            df_t = data.get(t)
+            if df_t is None or df_t.empty: continue
+            close = df_t[price_col(df_t)]
+            start_px = float(close.iloc[0]); end_px = float(close.iloc[-1])
+            init_cap = lot_size * start_px
+            end_cap_strategy = init_cap * float(res_df.loc[t, "LastEquity"])
+            pnl_strategy = end_cap_strategy - init_cap
+            end_cap_bh = lot_size * end_px
+            pnl_bh = end_cap_bh - init_cap
+            pay_rows.append({
+                "Ticker": t,
+                "StartPx": round(start_px,4), "EndPx": round(end_px,4),
+                "LotSize(sh)": int(lot_size), "Initial($)": round(init_cap,2),
+                "Ending_Strategy($)": round(end_cap_strategy,2), "P&L_Strategy($)": round(pnl_strategy,2),
+                "Ending_BuyHold($)": round(end_cap_bh,2), "P&L_BuyHold($)": round(pnl_bh,2),
+                "Δ P&L (Strat − B&H)($)": round(pnl_strategy - pnl_bh,2),
+            })
+        pay_df = pd.DataFrame(pay_rows).set_index("Ticker")
+        if not pay_df.empty:
+            totals = pay_df.select_dtypes(include=[float, int]).sum(numeric_only=True)
+            totals_df = pd.DataFrame(totals).T; totals_df.index = ["TOTAL"]
+            pay_df = pd.concat([pay_df, totals_df], axis=0)
+        st.subheader("💵 Simulated Payoffs")
+        st.dataframe(pay_df, use_container_width=True)
+
+        def _strategy_name_and_params(strategy, params):
+            if strategy == "SMA Crossover":
+                return strategy, {"Fast SMA": params.get("fast"), "Slow SMA": params.get("slow")}
+            elif strategy == "RSI Mean Reversion":
+                return strategy, {"RSI lookback": params.get("rsi_lb"),
+                                  "RSI Buy <": params.get("rsi_buy"),
+                                  "RSI Sell >": params.get("rsi_sell")}
+            else:
+                return strategy, {
+                    "Fast SMA": params.get("fast"), "Slow SMA": params.get("slow"),
+                    "RSI lookback": params.get("rsi_lb"), "RSI Buy <": params.get("rsi_buy"),
+                    "RSI Sell >": params.get("rsi_sell"), "Use MACD": params.get("use_macd"),
+                    "Combine": "AND" if params.get("use_and", False) else "Voting (≥2)",
+                    "ATR hot filter": params.get("atr_filter", False),
+                    "Max ATR/Price": params.get("atr_cap_pct"),
+                }
+        strat_name, strat_params = _strategy_name_and_params(strategy, params)
+
+        inputs_rows = [("Tickers", ", ".join(sorted(data.keys()))),
+                       ("Start", start_bt), ("End", end_bt), ("Strategy", strat_name)]
+        for k, v in strat_params.items(): inputs_rows.append((k, v))
+        inputs_rows += [("Long-only", long_only), ("Vol target (ann.)", vol_target),
+                        ("ATR Stop (×)", atr_stop), ("Take Profit (× ATR)", tp_mult),
+                        ("Cost per trade (%)", round(trade_cost*100,3)),
+                        ("Effective tax on gains (%)", round(tax_rate*100,3)),
+                        ("Lot size (sh)", int(lot_size))]
+        inputs_df = pd.DataFrame(inputs_rows, columns=["Parameter","Value"])
+        st.subheader("⚙️ Inputs")
+        st.dataframe(inputs_df, use_container_width=True)
+
+        with io.BytesIO() as output:
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                inputs_df.to_excel(writer, sheet_name="Inputs_&_Metrics", index=False, startrow=0)
+                res_df.reset_index().to_excel(writer, sheet_name="Inputs_&_Metrics", index=False, startrow=len(inputs_df)+2)
+                pay_df.reset_index().to_excel(writer, sheet_name="Simulated_Payoffs", index=False)
+                if debug_mode:
+                    if all_debug_rows:
+                        debug_cat = pd.concat(all_debug_rows, axis=0, ignore_index=True)
+                        debug_cat.to_excel(writer, sheet_name="Debug_Log", index=False)
+                    if all_dbg_summ:
+                        dbg_summary_df = pd.DataFrame(all_dbg_summ)
+                        dbg_summary_df.to_excel(writer, sheet_name="Debug_Summary", index=False)
+            data_xlsx = output.getvalue()
+
+        st.download_button("⬇️ Download Backtest Report (Excel)",
+                           data_xlsx, "Backtest_Report.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
