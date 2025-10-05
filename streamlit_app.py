@@ -76,7 +76,7 @@ def fetch_candles(sym: str, res: str, days: int) -> pd.DataFrame | None:
 
 st.divider()
 if st.button("🔌 Test Finnhub Connectivity"):
-    ok, msg = ping_finnhub()
+    ok, msg = ping_finnhub
     st.success(msg) if ok else st.error(msg)
 
 symbol = normalize_symbol(raw_symbol, is_tsx)
