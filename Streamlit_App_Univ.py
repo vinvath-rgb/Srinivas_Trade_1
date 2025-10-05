@@ -1,8 +1,9 @@
 # Srini_Integrated_Universe_Backtester.py
 # Filename-agnostic Streamlit app: Universe (ETF/Stocks/Both) + Backtester
-# - No st.switch_page calls (works regardless of filename)
-# - Universe results flow to Backtester via st.session_state
-# - Uses Yahoo/Stooq loader; later, you can plug in Questrade/IBKR without UI changes
+# - "Send to Backtester" sends BUY by default; optional WATCH; never AVOID.
+# - Max-to-send cap + preview
+# - Adaptive lookbacks if history is short
+# - No st.switch_page (works regardless of filename)
 
 import os, io, time
 import numpy as np
@@ -244,17 +245,14 @@ def backtest(df: pd.DataFrame, strategy: str, params: dict,
 
     if long_only: sig = sig.clip(lower=0.0)
 
-    # Vol targeting → position sizing
-    est_vol = realized_vol_series(rets, lookback=20)                 # EstVol (past)
-    lev = (vol_target / (est_vol + 1e-12)).clip(upper=5.0)           # cap 5x
+    est_vol = realized_vol_series(rets, lookback=20)
+    lev = (vol_target / (est_vol + 1e-12)).clip(upper=5.0)
     pos = (sig * lev).fillna(0.0)
 
-    # Execution with stops/TP
     atr = compute_atr(df, lb=14)
     pnl = apply_stops(df, pos, atr, atr_stop, tp_mult, trade_cost=trade_cost, tax_rate=tax_rate)
     equity = (1 + pnl).cumprod()
 
-    # Actual future vol (lookahead window)
     act_vol = future_realized_vol(rets, lookahead=20)
 
     stats = {
@@ -385,24 +383,43 @@ def near_52w_high(price: pd.Series, window: int = 252) -> float:
 def score_universe(data: dict[str, pd.DataFrame],
                    min_price: float, min_adv: float,
                    w_mom: float, w_trend: float, w_lowvol: float, w_prox: float,
-                   mom_lookbacks=(252-21, 126-21, 63-21)) -> pd.DataFrame:
+                   auto_adapt_lookbacks: bool = True,
+                   base_lookbacks=(252-21, 126-21, 63-21)) -> pd.DataFrame:
     rows = []
     for t, df in data.items():
         close = df[price_col(df)].dropna()
         vol   = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(index=close.index, dtype=float)
         if close.empty:
             continue
+
+        # ----- Adaptive lookbacks if history is short -----
+        L = len(close)
+        lb12, lb6, lb3 = base_lookbacks
+        if auto_adapt_lookbacks:
+            # keep at least ~40 trading days for a lookback to be meaningful
+            lb12 = max(min(lb12, max(L - 21, 0)), 40) if L > 60 else np.nan
+            lb6  = max(min(lb6,  max(L - 21, 0)), 30) if L > 50 else np.nan
+            lb3  = max(min(lb3,  max(L - 21, 0)), 20) if L > 40 else np.nan
+        # --------------------------------------------------
+
         last_px = float(close.iloc[-1])
         adv = avg_dollar_vol(close, vol, lb=20)
         if (not np.isnan(last_px) and last_px >= min_price) and (not np.isnan(adv) and adv >= min_adv):
-            m12 = pct_change_lb(close, mom_lookbacks[0])
-            m6  = pct_change_lb(close, mom_lookbacks[1])
-            m3  = pct_change_lb(close, mom_lookbacks[2])
+            m12 = pct_change_lb(close, int(lb12)) if not np.isnan(lb12) else np.nan
+            m6  = pct_change_lb(close, int(lb6))  if not np.isnan(lb6)  else np.nan
+            m3  = pct_change_lb(close, int(lb3))  if not np.isnan(lb3)  else np.nan
+
+            # trend proxy: prefer SMA200, fallback to SMA50 if short history
             sma200 = sma_last(close, 200)
+            if np.isnan(sma200):
+                sma200 = sma_last(close, 50)
             trend = (last_px / sma200 - 1.0) if (not np.isnan(sma200) and sma200 > 0) else np.nan
+
             vol20 = realized_vol_last(close, 20)
             inv_vol = (1.0 / vol20) if (vol20 and vol20 > 0) else np.nan
-            prox = near_52w_high(close, 252)
+
+            prox_w = min(L, 252)
+            prox = near_52w_high(close, prox_w) if L >= 20 else np.nan
 
             rows.append({
                 "Ticker": t,
@@ -413,31 +430,54 @@ def score_universe(data: dict[str, pd.DataFrame],
                 "InvVol20": inv_vol,
                 "Prox52W": prox
             })
+
     if not rows:
         return pd.DataFrame(columns=["Ticker","Last","ADV20","Mom12_1","Mom6_1","Mom3_1","Trend200","InvVol20","Prox52W","Score","Action"])
 
     dfm = pd.DataFrame(rows)
 
-    def pct_rank(col): return col.rank(pct=True, na_option="keep")
+    # If many NaNs (short history), compute ranks only on available columns
+    def pct_rank(col): 
+        return col.rank(pct=True, na_option="keep")
 
-    z_m12  = pct_rank(dfm["Mom12_1"])
-    z_m6   = pct_rank(dfm["Mom6_1"])
-    z_m3   = pct_rank(dfm["Mom3_1"])
-    mom_score = (0.5*z_m12 + 0.3*z_m6 + 0.2*z_m3)
+    z_parts = []
+    # Momentum blend: weigh only available components
+    comp = []
+    if dfm["Mom12_1"].notna().any(): comp.append((pct_rank(dfm["Mom12_1"]), 0.5))
+    if dfm["Mom6_1"].notna().any():  comp.append((pct_rank(dfm["Mom6_1"]), 0.3))
+    if dfm["Mom3_1"].notna().any():  comp.append((pct_rank(dfm["Mom3_1"]), 0.2))
+    if comp:
+        total_w = sum(w for _, w in comp)
+        mom_score = sum(z*w for z,w in comp) / (total_w if total_w>0 else 1.0)
+    else:
+        mom_score = pd.Series(np.nan, index=dfm.index)
+    z_trend = pct_rank(dfm["Trend200"]) if dfm["Trend200"].notna().any() else pd.Series(np.nan, index=dfm.index)
+    z_inv   = pct_rank(dfm["InvVol20"]) if dfm["InvVol20"].notna().any() else pd.Series(np.nan, index=dfm.index)
+    z_prox  = pct_rank(dfm["Prox52W"])  if dfm["Prox52W"].notna().any()  else pd.Series(np.nan, index=dfm.index)
 
-    z_trend = pct_rank(dfm["Trend200"])
-    z_inv   = pct_rank(dfm["InvVol20"])
-    z_prox  = pct_rank(dfm["Prox52W"])
+    # Build final score using only available factors per row
+    scores = []
+    for i in dfm.index:
+        parts = []
+        if not np.isnan(mom_score.iloc[i]): parts.append(w_mom   * mom_score.iloc[i])
+        if not np.isnan(z_trend.iloc[i]):   parts.append(w_trend * z_trend.iloc[i])
+        if not np.isnan(z_inv.iloc[i]):     parts.append(w_lowvol* z_inv.iloc[i])
+        if not np.isnan(z_prox.iloc[i]):    parts.append(w_prox  * z_prox.iloc[i])
+        scores.append(np.round(sum(parts), 4) if parts else np.nan)
 
-    total = (w_mom * mom_score +
-             w_trend * z_trend +
-             w_lowvol * z_inv +
-             w_prox * z_prox)
+    dfm["Score"] = scores
 
-    dfm["Score"] = np.round(total, 4)
-    p = dfm["Score"].rank(pct=True)
-    action = np.where(p >= 0.8, "BUY", np.where(p >= 0.6, "WATCH", "AVOID"))
-    dfm["Action"] = action
+    # Actions by percentile over non-NaN scores
+    valid = dfm["Score"].notna()
+    if valid.any():
+        p = dfm.loc[valid, "Score"].rank(pct=True)
+        action = pd.Series("AVOID", index=dfm.index, dtype=object)
+        action.loc[valid & (p >= 0.8)] = "BUY"
+        action.loc[valid & (p >= 0.6) & (p < 0.8)] = "WATCH"
+        dfm["Action"] = action
+    else:
+        dfm["Action"] = "AVOID"
+
     return dfm.sort_values(["Action","Score","Ticker"], ascending=[True, False, True])
 
 # ----------------------- APP LAYOUT -----------------------
@@ -449,7 +489,6 @@ tabs = st.tabs(["Universe", "Backtester"])
 with tabs[0]:
     st.subheader("Universe Builder")
 
-    # Choose ETF, Stocks, or Both
     uni_type = st.radio("Universe Type", ["ETF", "Stocks", "Both"], index=2, horizontal=True)
 
     with st.expander("Time Window & Filters", expanded=True):
@@ -458,6 +497,7 @@ with tabs[0]:
         end_u   = c2.date_input("History End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
         min_px  = c3.number_input("Min Price", 0.0, 10000.0, 5.0, 0.5)
         min_adv = c4.number_input("Min Avg Dollar Volume (20d)", 0.0, 1e12, 5_000_000.0, 100_000.0)
+        auto_adapt = st.checkbox("Auto-adapt lookbacks when history is short", value=True, help="Avoids all-AVOID when the date range is small")
 
     with st.expander("Factor Weights", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
@@ -469,88 +509,99 @@ with tabs[0]:
     with st.expander("Candidate Sets", expanded=True):
         default_etfs = "SPY, QQQ, IWM, DIA, XLK, XLF, XLE, XLI, XLP, XLY, XLU, XLB, XLV, XLC, XBI, SMH, ARKK, XIC.TO, XIU.TO, ZCN.TO, NIFTYBEES.NS, BANKBEES.NS"
         default_stks = "AAPL, MSFT, NVDA, AMZN, META, GOOGL, TSLA, AMD, AVGO, COST, RY.TO, TD.TO, CNQ.TO, ENB.TO, SHOP.TO, RELIANCE.NS, TCS.NS, HDFCBANK.NS, INFY.NS, ICICIBANK.NS"
-
         c1, c2 = st.columns(2)
         etf_input = c1.text_area("ETF Candidates", value=default_etfs, height=120, disabled=(uni_type=="Stocks"))
         stk_input = c2.text_area("Stock Candidates", value=default_stks, height=120, disabled=(uni_type=="ETF"))
 
-        c3, c4 = st.columns(2)
-        topN_etf = c3.number_input("Top N (ETF)", 1, 100, 10, 1, disabled=(uni_type=="Stocks"))
-        topN_stk = c4.number_input("Top N (Stocks)", 1, 200, 20, 1, disabled=(uni_type=="ETF"))
+    st.markdown("---")
+    with st.expander("Send options", expanded=True):
+        colA, colB, colC = st.columns([1,1,2])
+        include_watch = colA.checkbox("Include WATCH", value=False)
+        max_send = int(colB.number_input("Max tickers to send", 1, 500, 25, 1))
+        # this will hold the preview later
+        preview_placeholder = colC.empty()
 
     run_u = st.button("🚀 Build Universe")
 
+    etf_top = pd.DataFrame(); stk_top = pd.DataFrame()
     if run_u:
-        etf_top = pd.DataFrame(); stk_top = pd.DataFrame()
-
         if uni_type in ("ETF", "Both"):
             etfs = _to_list(etf_input)
             with st.spinner("Downloading ETF prices..."):
                 etf_data = load_prices(", ".join(etfs), start_u, end_u)
             with st.spinner("Scoring ETFs..."):
-                etf_df = score_universe(etf_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox)
+                etf_df = score_universe(etf_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox, auto_adapt_lookbacks=auto_adapt)
             st.subheader("📦 ETF Recommendations")
             if etf_df.empty:
                 st.warning("No ETFs passed filters.")
             else:
-                etf_top = etf_df.sort_values("Score", ascending=False).head(topN_etf).copy()
-                st.dataframe(etf_top, use_container_width=True)
-                etf_csv = etf_top.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download ETF Picks (CSV)", etf_csv, "etf_universe.csv", "text/csv")
+                st.dataframe(etf_df, use_container_width=True)
+                etf_top = etf_df.copy()
 
         if uni_type in ("Stocks", "Both"):
             stks = _to_list(stk_input)
             with st.spinner("Downloading Stock prices..."):
                 stk_data = load_prices(", ".join(stks), start_u, end_u)
             with st.spinner("Scoring Stocks..."):
-                stk_df = score_universe(stk_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox)
+                stk_df = score_universe(stk_data, min_px, min_adv, w_mom, w_trend, w_lv, w_prox, auto_adapt_lookbacks=auto_adapt)
             st.subheader("💎 Stock Recommendations")
             if stk_df.empty:
                 st.warning("No stocks passed filters.")
             else:
-                stk_top = stk_df.sort_values("Score", ascending=False).head(topN_stk).copy()
-                st.dataframe(stk_top, use_container_width=True)
-                stk_csv = stk_top.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download Stock Picks (CSV)", stk_csv, "stock_universe.csv", "text/csv")
+                st.dataframe(stk_df, use_container_width=True)
+                stk_top = stk_df.copy()
+
+        # Build the list that would be sent (respect action filter + cap)
+        def select_for_sending(df):
+            if df.empty: return []
+            allowed = ["BUY"] + (["WATCH"] if include_watch else [])
+            df2 = df[df["Action"].isin(allowed)].sort_values("Score", ascending=False)
+            return df2["Ticker"].tolist()[:max_send]
+
+        to_send = []
+        if uni_type in ("ETF", "Both"):
+            to_send += select_for_sending(etf_top)
+        if uni_type in ("Stocks", "Both"):
+            to_send += select_for_sending(stk_top)
+
+        # de-dupe preserving order
+        seen = set(); dedup = []
+        for t in to_send:
+            if t not in seen:
+                dedup.append(t); seen.add(t)
+        to_send = dedup
+
+        if to_send:
+            preview_placeholder.markdown("**Preview (to Backtester):** " + ", ".join(to_send))
+        else:
+            preview_placeholder.info("Nothing to send yet — try extending the date range, lowering filters, or enabling 'Include WATCH'.")
 
         st.markdown("---")
         c1, c2, c3 = st.columns(3)
 
-        def _send_notice_and_rerun(msg="Sent to Backtester ✔ — switch to the Backtester tab and hit Run."):
-            st.success(msg)
-            st.experimental_rerun()
+        def push_to_backtester(tickers_str: str):
+            st.session_state["final_tickers"] = tickers_str
+            st.session_state["bt_tickers"] = tickers_str   # update widget value directly
+            st.session_state["last_sent"] = tickers_str
+            st.toast("Sent to Backtester ✔ — switch to the Backtester tab and hit Run.")
 
-        if c1.button("➡️ Send ETF Picks to Backtester", disabled=etf_top.empty):
-            st.session_state["universe_tickers_etf"] = ", ".join(etf_top["Ticker"].tolist()) if not etf_top.empty else ""
-            st.session_state["universe_tickers_stock"] = st.session_state.get("universe_tickers_stock","")
-            st.session_state["final_tickers"] = st.session_state["universe_tickers_etf"]
-            _send_notice_and_rerun()
-
-        if c2.button("➡️ Send Stock Picks to Backtester", disabled=stk_top.empty):
-            st.session_state["universe_tickers_stock"] = ", ".join(stk_top["Ticker"].tolist()) if not stk_top.empty else ""
-            st.session_state["universe_tickers_etf"] = st.session_state.get("universe_tickers_etf","")
-            st.session_state["final_tickers"] = st.session_state["universe_tickers_stock"]
-            _send_notice_and_rerun()
-
-        if c3.button("➡️ Send BOTH (Merged) to Backtester", disabled=(etf_top.empty and stk_top.empty)):
-            e = etf_top["Ticker"].tolist() if not etf_top.empty else []
-            s = stk_top["Ticker"].tolist() if not stk_top.empty else []
-            merged, seen = [], set()
-            for x in e + s:
-                if x not in seen:
-                    merged.append(x); seen.add(x)
-            st.session_state["universe_tickers_etf"] = ", ".join(e)
-            st.session_state["universe_tickers_stock"] = ", ".join(s)
-            st.session_state["final_tickers"] = ", ".join(merged)
-            _send_notice_and_rerun()
+        if c3.button("➡️ Send to Backtester", disabled=(len(to_send)==0)):
+            push_to_backtester(", ".join(to_send))
 
 # ----------------------- TAB 2: BACKTESTER -----------------------
 with tabs[1]:
     st.subheader("Backtester — EstVol vs ActualVol (SMA / RSI / Composite)")
 
+    if "last_sent" in st.session_state:
+        st.info(f"Tickers received from Universe: {st.session_state['last_sent']}")
+
     default_tickers = st.session_state.get("final_tickers", "SPY, XLK, ACN, XIC.TO")
     c_top1, c_top2, c_top3 = st.columns([2,1,1])
-    tickers = c_top1.text_input("Tickers (comma-separated)", value=default_tickers, key="bt_tickers")
+    tickers = c_top1.text_input(
+        "Tickers (comma-separated)",
+        value=st.session_state.get("bt_tickers", default_tickers),
+        key="bt_tickers"
+    )
     start_bt = c_top2.date_input("Start", value=pd.to_datetime("2015-01-01")).strftime("%Y-%m-%d")
     end_bt   = c_top3.date_input("End",   value=pd.Timestamp.today()).strftime("%Y-%m-%d")
 
