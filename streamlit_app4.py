@@ -250,4 +250,4 @@ def strat_bollinger(df: pd.DataFrame, window=20, k=2.0) -> pd.Series:
     long_sig = (d["Close"] < lower).astype(int)
     exit_sig = (d["Close"] > upper).astype(int)
     pos = long_sig.copy()
-    pos = pos.where(!exit_sig, 0)  # <-- will error in Python; change to below
+    pos = pos.where(~exit_sig, 0)  # <-- will error in Python; change to below
