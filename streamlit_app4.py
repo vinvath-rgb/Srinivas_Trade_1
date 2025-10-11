@@ -1,526 +1,545 @@
-# streamlit_app.py
-# Strategy–Regime Matrix (Single File)
-# - Data fetch fallback: yfinance -> Stooq -> Finnhub (optional)
-# - Regime detection: volatility percentile (configurable)
-# - Strategies: SMA cross, Bollinger, RSI (long-only for simplicity)
-# - Plots: Equity Curves (rebased), Regime samples with shaded bands
-# - Robust plotting fixes: alignment, rebasing, state clearing, NaN-safe percentiles
+# streamlit_app.py — Single‑file Strategy–Regime Pipeline with Optimizer & Exports
+# Srini/Giligili build — v1.0 (2025-10-11)
+# 
+# Features
+# - Fetch prices (Yahoo → Stooq → Finnhub fallback) to WIDE format
+# - Cross‑sectional volatility regimes (per‑date percentiles)
+# - Strategies: SMA Cross, Bollinger, RSI (per‑asset signals)
+# - Optimizers: Equal‑Weight, Min‑Variance, Risk‑Parity (rolling covariance)
+# - Grid search “learning”: iterate strategy families/params → pick best by objective (Sharpe or CAGR)
+# - Baseline vs Optimized vs Buy‑&‑Hold comparison with metrics
+# - CSV/XLSX exports (prices, regimes, signals, weights, portfolio equity)
+#
+# Notes
+# - Keep grids modest in Render for speed; you can expand later.
+# - Finnhub is optional (set FINNHUB_API_KEY in env). Yahoo/Stooq used otherwise.
+# - This is self‑contained — paste into your repo as streamlit_app.py (or any name) and deploy.
 
-import os
-import math
-import time
-import json
+from __future__ import annotations
+import io, os, math, json, time
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 
-# ============== Streamlit setup ==============
-st.set_page_config(page_title="Strategy–Regime Matrix (Single File)", layout="wide")
-st.title("📈 Strategy–Regime Matrix (Single File)")
+# -----------------------------
+# Streamlit setup
+# -----------------------------
+st.set_page_config(page_title="Strategy–Regime Pipeline", layout="wide")
+st.title("📈 Strategy–Regime Pipeline — Universe → Regimes → Optimizer → Exports")
 
-# ============== Config / Env ==============
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 
-# Optional auth (set APP_PASSWORD env to enable)
-def _auth():
-    pw_env = os.getenv("APP_PASSWORD", "").strip()
-    if not pw_env:
-        return True
-    with st.sidebar:
-        st.subheader("🔐 App Login")
-        pw = st.text_input("Password", type="password")
-        if st.button("Login"):
-            st.session_state["_ok"] = (pw == pw_env)
-    return st.session_state.get("_ok", False)
-
-if not _auth():
-    st.stop()
-
-# Try to import yfinance
-YF_IMPORT_OK = True
+# Soft imports (don’t break if missing)
+YF_OK = True
 try:
     import yfinance as yf
 except Exception:
-    YF_IMPORT_OK = False
+    YF_OK = False
 
-# Try to import pandas_datareader for Stooq
 PDR_OK = True
 try:
-    from pandas_datareader import data as pdr
+    import pandas_datareader.data as pdr
 except Exception:
     PDR_OK = False
 
-# ============== Helpers ==============
+# -----------------------------
+# Helpers: dates, safe math
+# -----------------------------
+
 def to_utc_ts(dt: datetime) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
     return int(dt.timestamp())
 
-def _clean_symbol_for_stooq(sym: str) -> str:
-    """
-    Stooq symbols are a bit different:
-    - US equities: AAPL, MSFT (OK)
-    - Indices/ETFs may vary; TSX often needs .TO (not supported well on Stooq)
-    We'll just pass through and let PDR throw; this is a best-effort fallback.
-    """
-    return sym.strip()
+@st.cache_data(show_spinner=False)
+def _cagr(series: pd.Series) -> float:
+    if series.empty:
+        return 0.0
+    start, end = series.index[0], series.index[-1]
+    years = max((end - start).days / 365.25, 1e-9)
+    return (series.iloc[-1] / max(series.iloc[0], 1e-12)) ** (1/years) - 1
 
-def _fix_prices_df(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    # Standardize Date/Close structure, drop bad rows, sort, ensure float Close
-    df = df.copy()
-    if "date" in df.columns and "Date" not in df.columns:
-        df.rename(columns={"date": "Date"}, inplace=True)
-    if "close" in df.columns and "Close" not in df.columns:
-        df.rename(columns={"close": "Close"}, inplace=True)
-    # yfinance uses index as DatetimeIndex, pdr returns column "Close"
-    if "Date" not in df.columns and not isinstance(df.index, pd.DatetimeIndex):
-        # Try to coerce index to datetime
-        try:
-            df.index = pd.to_datetime(df.index)
-        except Exception:
-            pass
-    if "Date" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
-        df = df.reset_index().rename(columns={"index": "Date"})
-    if "Date" not in df.columns:
-        # Last resort: create Date from any column named 'time' etc.
-        for c in df.columns:
-            if c.lower() in ("time", "timestamp"):
-                df["Date"] = pd.to_datetime(df[c], errors="coerce")
-                break
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).sort_values("Date")
-        df = df.set_index("Date")
-    if "Close" in df.columns:
-        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-        df = df.dropna(subset=["Close"])
-    df["Ticker"] = symbol
-    return df[["Ticker", "Close"]]
+@st.cache_data(show_spinner=False)
+def _sharpe(returns: pd.Series, rf: float = 0.0, periods: int = 252) -> float:
+    if returns.dropna().empty:
+        return 0.0
+    excess = returns - rf/periods
+    mu = excess.mean() * periods
+    sigma = excess.std(ddof=0) * math.sqrt(periods)
+    return 0.0 if sigma == 0 or np.isnan(sigma) else mu / sigma
 
-def fetch_yfinance(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-    if not YF_IMPORT_OK:
+@st.cache_data(show_spinner=False)
+def _max_dd(equity: pd.Series) -> float:
+    if equity.dropna().empty:
+        return 0.0
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1
+    return dd.min()
+
+# -----------------------------
+# Fetch prices: Yahoo → Stooq → Finnhub
+# -----------------------------
+
+def _fetch_yahoo(ticker: str, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
+    if not YF_OK:
         raise RuntimeError("yfinance not available")
-    data = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
-    if data is None or data.empty:
-        raise RuntimeError("yfinance returned empty")
-    data = data.rename(columns={"Adj Close": "Close"})
-    if "Close" not in data.columns:
-        if "Adj Close" in data.columns:
-            data["Close"] = data["Adj Close"]
-        elif "close" in data.columns:
-            data["Close"] = data["close"]
-        else:
-            raise RuntimeError("No Close in yfinance frame")
-    data = data[["Close"]].copy()
-    data = data.reset_index().rename(columns={"Date": "Date"})
-    return _fix_prices_df(data, symbol)
+    try:
+        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            out = df[["Close"]].rename(columns={"Close": ticker})
+            out.index.name = "Date"
+            return out
+    except Exception:
+        pass
+    raise RuntimeError("Yahoo failed")
 
-def fetch_stooq(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+def _fetch_stooq(ticker: str, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     if not PDR_OK:
         raise RuntimeError("pandas_datareader not available")
-    s_sym = _clean_symbol_for_stooq(symbol)
-    df = pdr.DataReader(s_sym, "stooq", start, end)  # Stooq returns descending index
-    if df is None or df.empty:
-        raise RuntimeError("stooq returned empty")
-    df = df.rename(columns={"Close": "Close"})
-    df = df[["Close"]].copy().sort_index()
-    df = df.reset_index().rename(columns={"Date": "Date"})
-    return _fix_prices_df(df, symbol)
+    try:
+        t = ticker.replace("-", ".").upper()
+        df = pdr.DataReader(t, "stooq")
+        if not df.empty:
+            df = df.sort_index()
+            if start:
+                df = df[df.index >= pd.to_datetime(start)]
+            if end:
+                df = df[df.index <= pd.to_datetime(end)]
+            out = df[["Close"]].rename(columns={"Close": ticker})
+            out.index.name = "Date"
+            return out
+    except Exception:
+        pass
+    raise RuntimeError("Stooq failed")
 
-def fetch_finnhub(symbol: str, start: datetime, end: datetime, resolution: str = "D") -> pd.DataFrame:
+def _fetch_finnhub(ticker: str, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     if not FINNHUB_API_KEY:
-        raise RuntimeError("FINNHUB_API_KEY missing")
-    base = "https://finnhub.io/api/v1/stock/candle"
-    params = {
-        "symbol": symbol,
-        "resolution": resolution,
-        "from": to_utc_ts(start),
-        "to": to_utc_ts(end + timedelta(days=1)),
-        "token": FINNHUB_API_KEY
-    }
-    r = requests.get(base, params=params, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"Finnhub HTTP {r.status_code}")
-    j = r.json()
-    if j.get("s") != "ok":
-        raise RuntimeError(f"Finnhub status: {j.get('s')}")
-    df = pd.DataFrame({"Date": pd.to_datetime(np.array(j["t"], dtype="int64"), unit="s"),
-                       "Close": j["c"]})
-    return _fix_prices_df(df, symbol)
+        raise RuntimeError("Finnhub not configured")
+    try:
+        import requests
+        resolution = "D"
+        t0 = pd.to_datetime(start) if start else (pd.Timestamp.utcnow() - pd.Timedelta(days=365*5))
+        t1 = pd.to_datetime(end) if end else pd.Timestamp.utcnow()
+        url = f"https://finnhub.io/api/v1/stock/candle?symbol={ticker}&resolution={resolution}&from={int(t0.timestamp())}&to={int(t1.timestamp())}&token={FINNHUB_API_KEY}"
+        r = requests.get(url, timeout=30)
+        j = r.json()
+        if j.get("s") != "ok":
+            raise RuntimeError("Finnhub status not ok")
+        ts = pd.to_datetime(j["t"], unit="s")
+        close = pd.Series(j["c"], index=ts, name=ticker)
+        df = close.to_frame()
+        df.index.name = "Date"
+        return df
+    except Exception:
+        raise RuntimeError("Finnhub failed")
 
-def fetch_prices_for_ticker(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-    # Try yfinance -> stooq -> finnhub
-    errors = []
-    for fn in (fetch_yfinance, fetch_stooq, fetch_finnhub):
-        try:
-            return fn(symbol, start, end)
-        except Exception as e:
-            errors.append(f"{fn.__name__}: {e}")
-    raise RuntimeError("All fetchers failed:\n" + "\n".join(errors))
-
-def fetch_prices_for_universe(symbols: list[str], start: datetime, end: datetime, allow_partial=True) -> pd.DataFrame:
+@st.cache_data(show_spinner=True)
+def get_prices_wide(tickers: List[str], start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     frames = []
-    failures = []
-    for s in symbols:
-        try:
-            df = fetch_prices_for_ticker(s, start, end)
-            frames.append(df)
-        except Exception as e:
-            failures.append(f"{s}: {e}")
+    for t in tickers:
+        err = []
+        for fn in (_fetch_yahoo, _fetch_stooq, _fetch_finnhub):
+            try:
+                f = fn(t, start, end)
+                frames.append(f)
+                break
+            except Exception as e:
+                err.append(str(e))
+        else:
+            st.warning(f"All data sources failed for {t}: {err}")
     if not frames:
-        raise RuntimeError("No symbols fetched.\n" + "\n".join(failures))
-    out = pd.concat(frames, axis=0).sort_index()
-    if failures and not allow_partial:
-        raise RuntimeError("Some symbols failed and allow_partial=False:\n" + "\n".join(failures))
-    return out
+        return pd.DataFrame()
+    wide = pd.concat(frames, axis=1)
+    wide = wide.asfreq("B").ffill().dropna(how="all")
+    return wide
 
-# ============== Indicators & Regimes ==============
-def rolling_volatility(close: pd.Series, window=20) -> pd.Series:
-    rets = close.pct_change()
-    vol = rets.rolling(window, min_periods=window).std()
+# -----------------------------
+# Regimes: cross‑sectional vol percentiles per date
+# -----------------------------
+
+def _daily_vol(close: pd.Series, win: int = 20) -> pd.Series:
+    ret = close.pct_change()
+    vol = ret.rolling(win, min_periods=max(5, win//2)).std() * np.sqrt(252)
     return vol
 
-def compute_regime_percentile(vol: pd.Series, low_pct=0.30, high_pct=0.70) -> pd.Series:
-    # Compute thresholds over non-NaN values to avoid skew
-    vol_clean = vol.dropna()
-    if vol_clean.empty:
-        return pd.Series(index=vol.index, dtype="float64")
-    lo = np.nanpercentile(vol_clean, low_pct * 100.0)
-    hi = np.nanpercentile(vol_clean, high_pct * 100.0)
-    regime = pd.Series(1, index=vol.index)  # 0=low,1=mid,2=high
-    regime[vol <= lo] = 0
-    regime[vol >= hi] = 2
-    return regime.astype("int8")
+@st.cache_data(show_spinner=False)
+def compute_regimes_wide(wide_close: pd.DataFrame, vol_win: int = 20,
+                         low_pct: float = 0.40, high_pct: float = 0.60) -> pd.DataFrame:
+    if wide_close.empty:
+        return pd.DataFrame()
+    vols = wide_close.apply(_daily_vol, win=vol_win)
+    regimes = pd.DataFrame(index=wide_close.index, columns=wide_close.columns, dtype="Int64")
+    for dt, row in vols.iterrows():
+        r = pd.Series(1, index=row.index)  # default MID
+        valid = row.dropna()
+        if not valid.empty:
+            pct = valid.rank(pct=True)
+            r.loc[pct.index[pct <= low_pct]] = 0
+            r.loc[pct.index[pct >= high_pct]] = 2
+        regimes.loc[dt] = r
+    return regimes
 
-def SMA(series: pd.Series, window: int):
-    return series.rolling(window, min_periods=window).mean()
+# -----------------------------
+# Strategies: per‑asset signals
+# -----------------------------
 
-def BB(series: pd.Series, window=20, k=2.0):
-    mid = SMA(series, window)
-    std = series.rolling(window, min_periods=window).std()
-    upper = mid + k * std
-    lower = mid - k * std
-    return mid, upper, lower
+def sma(series: pd.Series, n: int) -> pd.Series:
+    return series.rolling(n, min_periods=max(3, n//3)).mean()
 
-def RSI(series: pd.Series, window=14):
-    delta = series.diff()
+def strat_sma_cross(close: pd.Series, fast: int = 10, slow: int = 40) -> pd.Series:
+    f, s = sma(close, fast), sma(close, slow)
+    sig = (f > s).astype(float)
+    sig.iloc[: max(fast, slow)] = 0.0
+    return sig
+
+def strat_bollinger(close: pd.Series, n: int = 20, k: float = 2.0) -> pd.Series:
+    ma = sma(close, n)
+    std = close.rolling(n, min_periods=max(3, n//3)).std()
+    upper, lower = ma + k*std, ma - k*std
+    sig = ((close < lower) | (close > upper)).astype(float)  # 1 when outside bands
+    sig.iloc[: n] = 0.0
+    return sig
+
+def strat_rsi(close: pd.Series, n: int = 14, lo: int = 30, hi: int = 70) -> pd.Series:
+    delta = close.diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain, index=series.index).rolling(window, min_periods=window).mean()
-    avg_loss = pd.Series(loss, index=series.index).rolling(window, min_periods=window).mean()
-    rs = avg_gain / avg_loss
+    avg_gain = pd.Series(gain, index=close.index).rolling(n, min_periods=max(3, n//3)).mean()
+    avg_loss = pd.Series(loss, index=close.index).rolling(n, min_periods=max(3, n//3)).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-# ============== Strategies (long-only examples) ==============
-def strat_sma_cross(close: pd.Series, fast=10, slow=40):
-    f, s = SMA(close, fast), SMA(close, slow)
-    sig = (f > s).astype(int)
+    sig = ((rsi < lo) | (rsi > hi)).astype(float)
+    sig.iloc[: n] = 0.0
     return sig
 
-def strat_bollinger(close: pd.Series, window=20, k=2.0):
-    mid, upper, lower = BB(close, window, k)
-    # long when price above mid and rising; exit when below mid
-    sig = (close > mid).astype(int)
-    return sig
-
-def strat_rsi(close: pd.Series, window=14, low=35, high=65):
-    r = RSI(close, window)
-    # long when RSI crosses up from below low; flat when crosses down from above high
-    sig = pd.Series(0, index=close.index, dtype=int)
-    sig[(r > low) & (r.shift(1) <= low)] = 1
-    sig[(r < high) & (r.shift(1) >= high)] = 0
-    sig = sig.replace(to_replace=0, method="ffill").fillna(0).astype(int)
-    return sig
-
-STRATEGIES = {
-    "sma_cross": ("SMA Cross", strat_sma_cross),
-    "bollinger": ("Bollinger Mid", strat_bollinger),
-    "rsi": ("RSI Band", strat_rsi),
+STRATEGY_FNS = {
+    "sma_cross": strat_sma_cross,
+    "bollinger": strat_bollinger,
+    "rsi": strat_rsi,
 }
 
-# ============== Backtest (vectorized, no commissions/slippage) ==============
-def run_backtest(close: pd.Series, signal: pd.Series) -> pd.Series:
-    # Align
-    df = pd.concat({"c": close, "sig": signal.astype(float)}, axis=1).dropna()
-    rets = df["c"].pct_change().fillna(0.0)
-    strat_rets = rets * df["sig"].shift(1).fillna(0.0)  # enter next bar
-    equity = (1.0 + strat_rets).cumprod()
-    return equity
+# -----------------------------
+# Optimizers (weights across active assets)
+# -----------------------------
 
-def perf_summary(equity: pd.Series) -> dict:
-    if equity.empty:
-        return {"CAGR%": np.nan, "Sharpe": np.nan, "MaxDD%": np.nan}
-    # CAGR
-    n_days = (equity.index[-1] - equity.index[0]).days
-    years = max(n_days / 365.25, 1e-9)
-    cagr = (equity.iloc[-1] ** (1 / years) - 1) * 100.0
-    # Daily returns Sharpe (approx)
-    r = equity.pct_change().dropna()
-    if r.std(ddof=0) == 0:
-        sharpe = 0.0
-    else:
-        sharpe = (r.mean() / r.std(ddof=0)) * math.sqrt(252)
-    # Max drawdown
-    peak = equity.cummax()
-    dd = equity / peak - 1.0
-    maxdd = dd.min() * 100.0
-    return {"CAGR%": cagr, "Sharpe": sharpe, "MaxDD%": maxdd}
-
-# ============== Plotting (robust / NaN-safe) ==============
-def _align_and_normalize(equity_dict: dict) -> pd.DataFrame:
-    """
-    equity_dict: {name: pd.Series}
-    Returns aligned DataFrame and rebased to 1.0 at first valid point of each series.
-    """
-    df = pd.concat(equity_dict, axis=1, join="inner")
-    if isinstance(df, pd.Series):
-        df = df.to_frame()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, errors="coerce")
-    df = df.sort_index().dropna(how="all")
-    # Rebase each column to 1.0
-    first = df.apply(lambda s: s.dropna().iloc[0] if s.dropna().size else np.nan)
-    df = df.divide(first)
-    df = df.dropna(axis=1, how="all")
-    return df
-
-def plot_equity_curves(equity_dict: dict, title="Equity Curves (rebased to 1.0)"):
-    import matplotlib.pyplot as plt
-    aligned = _align_and_normalize(equity_dict)
-    if aligned.empty:
-        st.warning("No equity data to plot after alignment/normalization.")
-        return
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    aligned.plot(ax=ax, linewidth=1.75)
-    ax.set_title(title)
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Rebased Equity (×)")
-    ax.grid(True, which="both", alpha=0.25)
-    fig.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-def plot_price_with_regime(df: pd.DataFrame, title="Regime sample", low_pct=0.30, high_pct=0.70):
-    import matplotlib.pyplot as plt
-    d = df.copy()
-    # Ensure datetime index
-    if not isinstance(d.index, pd.DatetimeIndex):
-        if "Date" in d.columns:
-            d.index = pd.to_datetime(d["Date"], errors="coerce")
-        d = d.sort_index()
-    # Need Close + Volatility
-    if "Close" not in d.columns or "Volatility" not in d.columns:
-        st.warning(f"Regime plot skipped for {title}: missing Close/Volatility.")
-        return
-    vol_clean = d["Volatility"].dropna()
-    if vol_clean.empty:
-        st.warning(f"Regime plot skipped for {title}: volatility empty.")
-        return
-    lo = np.nanpercentile(vol_clean, low_pct * 100.0)
-    hi = np.nanpercentile(vol_clean, high_pct * 100.0)
-
-    # Build regime mask
-    regime = pd.Series(1, index=d.index, dtype="int8")
-    regime[d["Volatility"] <= lo] = 0
-    regime[d["Volatility"] >= hi] = 2
-
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    ax.plot(d.index, d["Close"], linewidth=1.5, label="Close")
-    ax.set_title(title)
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price")
-    ax.grid(True, alpha=0.25)
-
-    # Shade regimes across contiguous spans
-    def _shade(mask: pd.Series, alpha=0.10):
-        spans = []
-        in_span = False
-        start = None
-        prev_t = None
-        for t, m in mask.items():
-            if m and not in_span:
-                in_span = True; start = t
-            if in_span and (not m):
-                spans.append((start, prev_t)); in_span = False
-            prev_t = t
-        if in_span:
-            spans.append((start, mask.index[-1]))
-        return spans
-
-    low_spans  = _shade(regime == 0, alpha=0.10)
-    high_spans = _shade(regime == 2, alpha=0.10)
-
-    for s, e in low_spans:
-        ax.axvspan(s, e, alpha=0.10, color="tab:blue", linewidth=0)
-    for s, e in high_spans:
-        ax.axvspan(s, e, alpha=0.10, color="tab:red", linewidth=0)
-
-    from matplotlib.patches import Patch
-    lh = [Patch(facecolor="tab:blue",  alpha=0.10, label=f"Low vol ≤ {low_pct:.0%}"),
-          Patch(facecolor="tab:red",   alpha=0.10, label=f"High vol ≥ {high_pct:.0%}")]
-    base_handles, base_labels = ax.get_legend_handles_labels()
-    ax.legend(handles=[*base_handles, *lh], loc="upper left")
-
-    fig.tight_layout()
-    st.pyplot(fig, clear_figure=True)
-
-# ============== UI ==============
-with st.sidebar:
-    st.header("⚙️ Settings")
-    tickers = st.text_input("Tickers (comma-separated)", value="AAPL,MSFT,SPY").strip()
-    default_days = 365 * 3
-    lookback_days = st.number_input("Lookback (days)", min_value=200, max_value=3650, value=default_days, step=50)
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=int(lookback_days))
-    st.caption(f"From {start_date} to {end_date} (UTC)")
-    st.markdown("---")
-    st.subheader("Regime thresholds")
-    low_pct  = st.slider("Low vol percentile", 0.05, 0.45, 0.30, 0.01)
-    high_pct = st.slider("High vol percentile", 0.55, 0.95, 0.70, 0.01)
-    vol_window = st.number_input("Volatility window", min_value=10, max_value=120, value=20, step=1)
-    st.markdown("---")
-    st.subheader("Strategies")
-    chosen = st.multiselect("Select strategies", options=list(STRATEGIES.keys()),
-                            default=["sma_cross", "bollinger", "rsi"])
-    st.markdown("---")
-    st.subheader("Optional CSV upload")
-    st.caption("WIDE format: Date + one column per ticker (Close). LONG format: Date,Ticker,Close")
-    upload = st.file_uploader("Upload CSV", type=["csv"])
-
-# ============== Data sourcing ==============
-def read_csv_any(upload_file) -> pd.DataFrame:
-    if upload_file is None:
-        return pd.DataFrame()
+def _min_var_weights(cov: pd.DataFrame) -> pd.Series:
+    # w ∝ Σ^{-1} 1
+    if cov.isna().any().any():
+        cov = cov.fillna(cov.mean()).fillna(0)
     try:
-        df = pd.read_csv(upload_file)
+        inv = np.linalg.pinv(cov.values)
+        ones = np.ones((cov.shape[0], 1))
+        w = inv @ ones
+        w = w / (ones.T @ inv @ ones)
+        w = np.clip(w.flatten(), 0, None)
+        if w.sum() == 0:
+            w = np.ones_like(w)
+        w = w / w.sum()
+        return pd.Series(w, index=cov.index)
     except Exception:
-        upload_file.seek(0)
-        df = pd.read_csv(upload_file, encoding_errors="ignore")
-    # Try to detect format
-    cols = [c.lower() for c in df.columns]
-    if all(k in cols for k in ["date", "ticker", "close"]):
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).sort_values("Date")
-        df = df[["Date", "Ticker", "Close"]]
-        df = df.set_index("Date")
-        return df
-    # WIDE format
-    if "date" in cols:
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).sort_values("Date").set_index("Date")
-        # melt to LONG
-        stacked = df.stack().reset_index()
-        stacked.columns = ["Date", "Ticker", "Close"]
-        stacked = stacked.dropna(subset=["Close"])
-        stacked = stacked.set_index("Date").sort_index()
-        return stacked
-    # Unknown
-    return pd.DataFrame()
+        return pd.Series(np.repeat(1/cov.shape[0], cov.shape[0]), index=cov.index)
 
-def get_universe_df() -> pd.DataFrame:
-    if upload is not None:
-        df = read_csv_any(upload)
-        if not df.empty:
-            return df
-    symbols = [s.strip() for s in tickers.split(",") if s.strip()]
-    start = datetime.combine(start_date, datetime.min.time())
-    end   = datetime.combine(end_date,   datetime.min.time())
-    df = fetch_prices_for_universe(symbols, start, end, allow_partial=True)
-    return df
+def _risk_parity_weights(cov: pd.DataFrame, iters: int = 200) -> pd.Series:
+    # Simple iterative scheme for equal risk contributions
+    n = cov.shape[0]
+    w = np.ones(n) / n
+    target = np.ones(n) / n
+    for _ in range(iters):
+        mrc = cov.values @ w
+        rc = w * mrc
+        diff = rc - target
+        grad = mrc + cov.values @ w  # rough gradient
+        step = 0.01
+        w = w - step * grad * diff
+        w = np.clip(w, 0, None)
+        s = w.sum()
+        if s == 0:
+            w = np.ones(n)/n
+        else:
+            w /= s
+    return pd.Series(w, index=cov.index)
 
-# ============== Run ==============
-run = st.button("▶️ Run Backtest")
+def get_optimizer(name: str):
+    if name == "equal_weight":
+        return lambda cov: pd.Series(np.repeat(1/cov.shape[0], cov.shape[0]), index=cov.index)
+    if name == "min_variance":
+        return _min_var_weights
+    if name == "risk_parity":
+        return _risk_parity_weights
+    return lambda cov: pd.Series(np.repeat(1/cov.shape[0], cov.shape[0]), index=cov.index)
+
+# -----------------------------
+# Backtest engine
+# -----------------------------
+
+def run_backtest(wide_close: pd.DataFrame, signals: pd.DataFrame,
+                 optimizer: str = "equal_weight", lookback: int = 60) -> Tuple[pd.Series, pd.DataFrame]:
+    """Return (equity, weights_history). weights_history indexed by date with columns=assets (NaN if not invested)."""
+    if wide_close.empty or signals.empty:
+        return pd.Series(dtype=float), pd.DataFrame()
+    ret = wide_close.pct_change().fillna(0)
+    opt_fn = get_optimizer(optimizer)
+
+    dates = wide_close.index
+    assets = list(wide_close.columns)
+    weights_hist = []
+    equity = [1.0]
+
+    for i in range(1, len(dates)):
+        dt = dates[i]
+        hist_start = max(0, i - lookback)
+        hist = ret.iloc[hist_start:i]
+
+        active = [a for a in assets if signals.loc[dt, a] > 0.5]
+        if len(active) == 0:
+            w = pd.Series(0.0, index=assets)
+        elif len(active) == 1:
+            w = pd.Series(0.0, index=assets)
+            w.loc[active[0]] = 1.0
+        else:
+            cov = hist[active].cov()
+            w_active = opt_fn(cov)
+            w = pd.Series(0.0, index=assets)
+            w[w_active.index] = w_active
+
+        weights_hist.append(w)
+        port_ret = float((ret.iloc[i, :] * w).sum())
+        equity.append(equity[-1] * (1 + port_ret))
+
+    weights_df = pd.DataFrame(weights_hist, index=dates[1:], columns=assets)
+    equity_ser = pd.Series(equity, index=dates, name="Equity")
+    return equity_ser, weights_df
+
+# -----------------------------
+# Grid search (learning) across strategies/params
+# -----------------------------
+
+def build_signals(wide_close: pd.DataFrame, strategy: str, params: dict) -> pd.DataFrame:
+    fn = STRATEGY_FNS[strategy]
+    sigs = {}
+    for c in wide_close.columns:
+        sigs[c] = fn(wide_close[c], **params)
+    out = pd.DataFrame(sigs, index=wide_close.index)
+    return out.fillna(0.0)
+
+@dataclass
+class BTResult:
+    name: str
+    params: dict
+    strategy: str
+    optimizer: str
+    equity: pd.Series
+    weights: pd.DataFrame
+    sharpe: float
+    cagr: float
+    maxdd: float
+
+@st.cache_data(show_spinner=True)
+def evaluate_combo(wide_close: pd.DataFrame, strategy: str, params: dict, optimizer: str,
+                   lookback: int, objective: str) -> BTResult:
+    signals = build_signals(wide_close, strategy, params)
+    equity, weights = run_backtest(wide_close, signals, optimizer=optimizer, lookback=lookback)
+    rets = equity.pct_change().fillna(0)
+    sharpe = _sharpe(rets)
+    cagr = _cagr(equity)
+    maxdd = _max_dd(equity)
+    score = sharpe if objective == "Sharpe" else cagr
+    name = f"{strategy} {params} | {optimizer} | {objective}={score:.3f}"
+    return BTResult(name, params, strategy, optimizer, equity, weights, sharpe, cagr, maxdd)
+
+@st.cache_data(show_spinner=True)
+def grid_search(wide_close: pd.DataFrame, objective: str, optimizer: str, lookback: int) -> Tuple[BTResult, List[BTResult]]:
+    grid: List[Tuple[str, dict]] = []
+    # modest grid for speed; expand later
+    for f,s in [(5,20), (10,40), (20,60)]:
+        grid.append(("sma_cross", {"fast": f, "slow": s}))
+    for n,k in [(20,2.0), (20,2.5), (30,2.0)]:
+        grid.append(("bollinger", {"n": n, "k": k}))
+    for n in [14, 21]:
+        grid.append(("rsi", {"n": n, "lo": 30, "hi": 70}))
+
+    results: List[BTResult] = []
+    best: Optional[BTResult] = None
+    for strat, params in grid:
+        res = evaluate_combo(wide_close, strat, params, optimizer, lookback, objective)
+        results.append(res)
+        if best is None:
+            best = res
+        else:
+            if objective == "Sharpe":
+                if res.sharpe > best.sharpe:
+                    best = res
+            else:
+                if res.cagr > best.cagr:
+                    best = res
+    return best, results
+
+# -----------------------------
+# Buy & Hold benchmark
+# -----------------------------
+
+def buy_hold_equity(wide_close: pd.DataFrame) -> pd.Series:
+    if wide_close.empty:
+        return pd.Series(dtype=float)
+    rets = wide_close.pct_change().mean(axis=1).fillna(0)  # simple average across assets
+    eq = (1 + rets).cumprod()
+    eq.iloc[0] = 1.0
+    return eq
+
+# -----------------------------
+# UI Sidebar — Inputs
+# -----------------------------
+
+with st.sidebar:
+    st.subheader("🧭 Universe & Dates")
+    tickers_text = st.text_area("Tickers (comma‑separated)", value="AAPL, MSFT, AMZN, GOOGL, META")
+    start = st.date_input("Start", value=pd.to_datetime("2019-01-01").date())
+    end = st.date_input("End", value=pd.to_datetime("today").date())
+
+    st.subheader("⚙️ Regime Settings")
+    vol_win = st.number_input("Vol window", value=20, min_value=5, max_value=120, step=5)
+    low_pct = st.slider("Low vol percentile", 0.05, 0.45, 0.40, 0.05)
+    high_pct = st.slider("High vol percentile", 0.55, 0.95, 0.60, 0.05)
+
+    st.subheader("🧪 Backtest & Optimizer")
+    optimizer = st.selectbox("Optimizer", ["equal_weight", "min_variance", "risk_parity"], index=0)
+    lookback = st.number_input("Optimizer lookback (days)", value=60, min_value=20, max_value=252, step=10)
+    objective = st.selectbox("Optimization objective", ["Sharpe", "CAGR"], index=0)
+
+    st.subheader("🎯 Baseline Strategy")
+    base_family = st.selectbox("Baseline strategy", ["sma_cross", "bollinger", "rsi"], index=0)
+    if base_family == "sma_cross":
+        base_params = {"fast": st.number_input("fast", value=10, min_value=3, max_value=60),
+                       "slow": st.number_input("slow", value=40, min_value=5, max_value=200)}
+    elif base_family == "bollinger":
+        base_params = {"n": st.number_input("n", value=20, min_value=5, max_value=120),
+                       "k": st.number_input("k", value=2.0, min_value=0.5, max_value=4.0, step=0.1)}
+    else:
+        base_params = {"n": st.number_input("n", value=14, min_value=5, max_value=60),
+                       "lo": st.number_input("lo", value=30, min_value=5, max_value=50),
+                       "hi": st.number_input("hi", value=70, min_value=50, max_value=95)}
+
+    run = st.button("▶️ Run Pipeline", use_container_width=True)
+
+# -----------------------------
+# Main execution
+# -----------------------------
 
 if run:
-    try:
-        raw = get_universe_df()
-    except Exception as e:
-        st.error(f"Data fetch failed: {e}")
-        st.stop()
+    tickers = [t.strip() for t in tickers_text.split(',') if t.strip()]
+    with st.status("Fetching prices & building universe…", expanded=False):
+        wide = get_prices_wide(tickers, str(start), str(end))
+        if wide.empty:
+            st.error("No price data fetched. Check tickers or data sources.")
+            st.stop()
+        st.write("✅ Prices shape:", wide.shape)
 
-    if raw.empty:
-        st.warning("No data to process.")
-        st.stop()
+    with st.expander("Preview: Prices (last 5 rows)", expanded=False):
+        st.dataframe(wide.tail())
 
-    # Pivot to WIDE by ticker
-    wide = raw.reset_index().pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last")
-    wide = wide.sort_index().dropna(how="all")
+    regimes = compute_regimes_wide(wide, vol_win=vol_win, low_pct=low_pct, high_pct=high_pct)
+    with st.expander("Preview: Regimes (0=Low,1=Mid,2=High) — last 5", expanded=False):
+        st.dataframe(regimes.tail())
 
-    # Compute volatility & regimes per ticker
-    vols = pd.DataFrame(index=wide.index)
-    regimes = pd.DataFrame(index=wide.index, dtype="int8")
-    for t in wide.columns:
-        v = rolling_volatility(wide[t], window=int(vol_window))
-        vols[t] = v
-        regimes[t] = compute_regime_percentile(v, low_pct=low_pct, high_pct=high_pct)
+    # Baseline
+    st.subheader("Baseline vs Optimized vs Buy‑&‑Hold")
+    base_signals = build_signals(wide, base_family, base_params)
+    base_eq, base_w = run_backtest(wide, base_signals, optimizer=optimizer, lookback=lookback)
+    base_ret = base_eq.pct_change().fillna(0)
 
-    # Backtest each strategy per ticker
-    equity_curves = {}  # { "TICKER:STRAT": series }
-    perf_rows = []      # rows for summary
+    # Optimized (grid search)
+    best, all_results = grid_search(wide, objective=objective, optimizer=optimizer, lookback=lookback)
 
-    for t in wide.columns:
-        close = wide[t].dropna()
-        if close.size < max(60, int(vol_window) + 10):
-            continue
-        for key in chosen:
-            label, fn = STRATEGIES[key]
-            # Strategy-specific defaults:
-            if key == "sma_cross":
-                sig = fn(close, fast=10, slow=40)
-            elif key == "bollinger":
-                sig = fn(close, window=20, k=2.0)
-            elif key == "rsi":
-                sig = fn(close, window=14, low=35, high=65)
-            else:
-                continue
-            eq = run_backtest(close, sig)
-            equity_curves[f"{t}:{key}"] = eq
-            ps = perf_summary(eq)
-            perf_rows.append({
-                "Ticker": t,
-                "Strategy": label,
-                "CAGR%": round(ps["CAGR%"], 2) if not np.isnan(ps["CAGR%"]) else np.nan,
-                "Sharpe": round(ps["Sharpe"], 2) if not np.isnan(ps["Sharpe"]) else np.nan,
-                "MaxDD%": round(ps["MaxDD%"], 2) if not np.isnan(ps["MaxDD%"]) else np.nan,
-            })
+    # Buy & Hold
+    bh_eq = buy_hold_equity(wide)
 
-    # ======= Output: Performance Summary =======
-    st.subheader("📊 Performance Summary")
-    if perf_rows:
-        df_perf = pd.DataFrame(perf_rows).sort_values(["Ticker", "Strategy"])
-        st.dataframe(df_perf, use_container_width=True)
-    else:
-        st.info("No strategies produced results (insufficient data or inputs).")
-
-    # ======= Output: Equity Curves (rebased) =======
-    st.subheader("📈 Equity Curves")
-    if equity_curves:
-        plot_equity_curves(equity_curves, title="Equity Curves (rebased to 1.0)")
-    else:
-        st.info("No equity curves to display.")
-
-    # ======= Output: Regime samples =======
-    st.subheader("🧭 Regime (volatility percentile)")
-    # Show up to 3 sample tickers
-    sample_tickers = list(wide.columns)[:3]
-    for t in sample_tickers:
-        df_plot = pd.DataFrame({
-            "Close": wide[t],
-            "Volatility": vols[t],
-        }).dropna(subset=["Close"])
-        plot_price_with_regime(df_plot, title=f"{t} regime sample", low_pct=low_pct, high_pct=high_pct)
-
-    st.caption("Done.")
-else:
-    st.info("Configure settings on the left, then click **Run Backtest**.")
-
-# ============== Footer / Debug ==============
-with st.expander("ℹ️ Info & Debug"):
-    st.write({
-        "yfinance_available": YF_IMPORT_OK,
-        "pandas_datareader_available": PDR_OK,
-        "finnhub_enabled": bool(FINNHUB_API_KEY),
+    # Metrics table
+    rows = []
+    rows.append({
+        "Model": f"Baseline: {base_family} {base_params} | {optimizer}",
+        "Sharpe": round(_sharpe(base_ret), 3),
+        "CAGR": round(_cagr(base_eq), 3),
+        "MaxDD": round(_max_dd(base_eq), 3),
     })
+    rows.append({
+        "Model": f"Optimized: {best.strategy} {best.params} | {best.optimizer}",
+        "Sharpe": round(best.sharpe, 3),
+        "CAGR": round(best.cagr, 3),
+        "MaxDD": round(best.maxdd, 3),
+    })
+    rows.append({
+        "Model": "Buy & Hold (avg basket)",
+        "Sharpe": round(_sharpe(bh_eq.pct_change().fillna(0)), 3),
+        "CAGR": round(_cagr(bh_eq), 3),
+        "MaxDD": round(_max_dd(bh_eq), 3),
+    })
+    st.dataframe(pd.DataFrame(rows))
+
+    # Charts
+    st.subheader("Equity Curves")
+    chart_df = pd.concat([
+        base_eq.rename("Baseline"),
+        best.equity.rename("Optimized"),
+        bh_eq.rename("Buy&Hold"),
+    ], axis=1).dropna(how="all")
+    st.line_chart(chart_df)
+
+    with st.expander("Weights over time — Optimized (last 120 days)", expanded=False):
+        st.dataframe(best.weights.tail(120))
+
+    # -----------------------------
+    # Exports: CSV & XLSX
+    # -----------------------------
+    st.subheader("⬇️ Export Outputs")
+
+    def _to_csv_bytes(df: pd.DataFrame) -> bytes:
+        return df.to_csv(index=True).encode("utf-8")
+
+    def _to_xlsx_bytes(dfs: Dict[str, pd.DataFrame]) -> bytes:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            for name, df in dfs.items():
+                df.to_excel(xw, sheet_name=name[:31])
+        buf.seek(0)
+        return buf.read()
+
+    exports = {
+        "prices": wide,
+        "regimes": regimes,
+        "baseline_signals": base_signals,
+        "baseline_weights": base_w,
+        "baseline_equity": base_eq.to_frame(),
+        "optimized_signals": build_signals(wide, best.strategy, best.params),
+        "optimized_weights": best.weights,
+        "optimized_equity": best.equity.to_frame(),
+        "buy_hold_equity": bh_eq.to_frame(),
+        "metrics_table": pd.DataFrame(rows),
+    }
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("Download ALL as XLSX", data=_to_xlsx_bytes(exports), file_name="pipeline_outputs.xlsx")
+    with c2:
+        st.download_button("Download metrics.csv", data=_to_csv_bytes(pd.DataFrame(rows)), file_name="metrics.csv")
+
+    # Debug panel
+    with st.expander("Info & Debug", expanded=False):
+        st.json({
+            "yfinance_available": YF_OK,
+            "pandas_datareader_available": PDR_OK,
+            "finnhub_enabled": bool(FINNHUB_API_KEY),
+            "tickers": tickers,
+            "date_range": [str(start), str(end)],
+            "optimizer": optimizer,
+            "objective": objective,
+            "baseline": {"family": base_family, "params": base_params},
+            "optimized": {"family": best.strategy, "params": best.params},
+        })
+else:
+    st.info("Set your universe & click ▶️ Run Pipeline.")
